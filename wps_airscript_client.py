@@ -52,21 +52,27 @@ class WPSAirScriptClient:
         """
         url = f"{self.base_url}/api/v3/ide/file/{self.file_id}/script/{self.script_id}/sync_task"
         
-        try:
-            response = requests.post(
-                url=url,
-                headers=self._get_headers(),
-                json={"Context": context},
-                timeout=123
-            )
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"请求失败: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                print(f"响应状态码: {e.response.status_code}")
-                print(f"响应内容: {e.response.text}")
-            raise
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = requests.post(
+                    url=url,
+                    headers=self._get_headers(),
+                    json={"Context": context},
+                    proxies={"http": None, "https": None},
+                    timeout=123
+                )
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.RequestException as e:
+                if attempt == max_retries:
+                    print(f"请求失败: {e}")
+                    if hasattr(e, 'response') and e.response is not None:
+                        print(f"响应状态码: {e.response.status_code}")
+                        print(f"响应内容: {e.response.text}")
+                    raise
+                import time
+                time.sleep(0.5)
 
     def _extract_result(self, result: Any) -> Any:
         """

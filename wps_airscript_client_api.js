@@ -29,9 +29,7 @@ if (typeof Context !== "undefined" && Context.argv) {
     console.log("Context:", JSON.stringify(Context));
 
     var argv = Context.argv;
-    // 注：WPS这个框架，存在一个坑，它擅自把用户从接口传入的sheet_name字段，自动改成了active_sheet这个名称！！！
-    // Context示例: {"active_sheet":"工作表1","range":"$E$39","argv":{"woa_app":"db_assistant"},"link_from":""}
-    var sheetName = argv.thisSheetName || Application.ActiveSheet.Name;
+    var sheetName = argv.thisSheetName || (Application.ActiveSheet ? Application.ActiveSheet.Name : (Application.ActiveWorkbook && Application.ActiveWorkbook.Sheets && Application.ActiveWorkbook.Sheets.Count > 0 ? Application.ActiveWorkbook.Sheets.Item(1).Name : ""));
     
     // 如果有 items 数据，使用 setRangeValues 批量写入
     if (argv.items && Array.isArray(argv.items)) {
@@ -483,16 +481,16 @@ function getWorksheetByName(sheetName) {
 
   // 精确匹配
   for (let i = 1; i <= sheetCount; i++) {
-    const sheet = workbook.Sheets(i);
-    if (sheet.Name === sheetName) {
+    const sheet = workbook.Sheets.Item ? workbook.Sheets.Item(i) : (typeof workbook.Sheets === "function" ? workbook.Sheets(i) : workbook.Sheets[i]);
+    if (sheet && sheet.Name === sheetName) {
       return sheet;
     }
   }
 
   // 模糊匹配（包含）
   for (let i = 1; i <= sheetCount; i++) {
-    const sheet = workbook.Sheets(i);
-    if (sheet.Name.includes(sheetName)) {
+    const sheet = workbook.Sheets.Item ? workbook.Sheets.Item(i) : (typeof workbook.Sheets === "function" ? workbook.Sheets(i) : workbook.Sheets[i]);
+    if (sheet && sheet.Name && sheet.Name.includes(sheetName)) {
       // console.log("找到匹配的工作表:", sheet.Name);
       return sheet;
     }

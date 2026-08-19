@@ -4,12 +4,14 @@ WPS 智能表格 API 测试用例
 """
 
 from wps_airscript_client import WPSAirScriptClient
+from config import get_balance_sheet_config
 
 # ==================== 配置信息 ====================
-# 务必先阅读Readme.md文件，学习如何获取自己的WPS在线智能表的以下这3个参数！
-FILE_ID = "*********"  # 替换为你的智能表格ID
-TOKEN = "*************************"  # 替换为你的 Token令牌
-SCRIPT_ID = "V2-******************"  # 替换为你的脚本ID
+# 优先从本地 .env 或环境变量中自动获取，如未配置则可直接修改下方变量
+_f_id, _t, _s_id = get_balance_sheet_config()
+FILE_ID = _f_id if _f_id != "your_balance_sheet_file_id" else "*********"
+TOKEN = _t if _t != "your_token_here" else "*************************"
+SCRIPT_ID = _s_id if _s_id != "your_balance_sheet_script_id" else "V2-******************"
 SHEET_NAME = "工作表1"  # 默认工作表名称
 
 # ==================== 初始化客户端 ====================
