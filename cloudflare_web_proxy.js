@@ -337,6 +337,24 @@ function rewriteHtmlContent(html, workerOrigin) {
   return html;
 }
 
+function rewriteJsContent(js, workerOrigin) {
+  // 替换 JS 中的常见绝对域名，防止 JS 内部直连
+  const domains = [
+    "account.wps.cn",
+    "account.kdocs.cn",
+    "passport.wps.cn",
+    "www.wps.cn",
+    "vip.wps.cn"
+  ];
+
+  for (const d of domains) {
+    const reg = new RegExp("https://" + d.replace(/\./g, "\\."), "g");
+    js = js.replace(reg, workerOrigin + "/https://" + d);
+  }
+
+  return js;
+}
+
 function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
   const interceptorScript = `
 <script>
