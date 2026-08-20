@@ -102,7 +102,7 @@ export default {
 
       // 重写响应头
       const modifiedHeaders = new Headers(response.headers);
-      modifiedHeaders.set("Access-Control-Allow-Origin": "*");
+      modifiedHeaders.set("Access-Control-Allow-Origin", "*");
       modifiedHeaders.set("Access-Control-Allow-Credentials", "true");
 
       const currentHost = targetUrl.host;
