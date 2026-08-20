@@ -562,6 +562,63 @@ function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
     const form = e.target;
     if (form.action) form.action = wrap(form.action);
   }, true);
+
+  // 自动激活微信二维码与多方式登录切换
+  window.addEventListener('DOMContentLoaded', function() {
+    setTimeout(function() {
+      // 1. 自动请求并挂载微信扫码登录二维码
+      var wxWrap = document.getElementById('wxQRcode');
+      if (wxWrap) {
+        var params = {};
+        try {
+          var u = new URL(location.href);
+          u.searchParams.forEach(function(v, k) { params[k] = v; });
+        } catch(e) {}
+        params.utype = "wechat";
+        params.keeponline = 1;
+        params.action = "verify";
+        params.wpsmobile = false;
+        
+        var queryStr = Object.keys(params).map(function(k) {
+          return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]);
+        }).join('&');
+        
+        fetch(PROXY + '/https://account.wps.cn/p/oauth/url?' + queryStr)
+          .then(function(res) { return res.json(); })
+          .then(function(data) {
+            if (data && data.url) {
+              wxWrap.innerHTML = '<iframe src="' + data.url + '" frameborder="0" scrolling="no" width="300" height="300" style="border:none;overflow:hidden;margin:0 auto;display:block;"></iframe>';
+            }
+          }).catch(function(e) {});
+      }
+
+      // 2. 增强底部登录方式切换交互（点击手机/密码/更多直接平滑展开对应面板）
+      document.addEventListener('click', function(e) {
+        var t = e.target;
+        var text = t ? (t.innerText || '') : '';
+        if (text.includes('手机') || (t.closest && t.closest('.icon_round_phone'))) {
+          var sms = document.getElementById('smsWrap');
+          var main = document.getElementById('mainWrap');
+          if (sms && main) {
+            main.style.display = 'none';
+            sms.style.display = 'block';
+          }
+        } else if (text.includes('账号密码') || text.includes('更多') || (t.closest && t.closest('.icon_round_login_more'))) {
+          var acc = document.getElementById('accountWrap') || document.getElementById('moreWrap');
+          var main = document.getElementById('mainWrap');
+          if (acc && main) {
+            main.style.display = 'none';
+            acc.style.display = 'block';
+          }
+        } else if (text.includes('返回') || (t.closest && t.closest('.nav_back'))) {
+          var allMains = document.querySelectorAll('.main_item');
+          allMains.forEach(function(m) { m.style.display = 'none'; });
+          var main = document.getElementById('mainWrap');
+          if (main) main.style.display = 'block';
+        }
+      });
+    }, 100);
+  });
 })();
 </script>
 `;
