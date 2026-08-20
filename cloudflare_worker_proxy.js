@@ -10,7 +10,7 @@
  */
 
 // 默认备用密码（建议在 Cloudflare 控制台环境变量 PROXY_PASSWORD 中配置）
-const DEFAULT_PASSWORD = "MySecretPassword2026";
+const DEFAULT_PASSWORD = "atwasoft";
 
 export default {
   async fetch(request, env, ctx) {

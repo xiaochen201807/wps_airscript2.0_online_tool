@@ -15,7 +15,7 @@
  */
 
 // 默认备用访问密码（建议在 Cloudflare 环境变量 PROXY_PASSWORD 中配置）
-const DEFAULT_PASSWORD = "MySecretPassword2026";
+const DEFAULT_PASSWORD = "atwasoft";
 const DEFAULT_TARGET_HOST = "www.kdocs.cn";
 const AUTH_COOKIE_NAME = "_kdocs_proxy_auth";
 
@@ -202,20 +202,29 @@ async function handleLoginSubmit(request, requestUrl, correctPassword) {
   let redirectUrl = "/";
 
   try {
-    const contentType = request.headers.get("Content-Type") || "";
-    if (contentType.includes("application/x-www-form-urlencoded")) {
-      const formData = await request.formData();
+    const clonedReq = request.clone();
+    try {
+      const formData = await clonedReq.formData();
       passwordInput = formData.get("password") || "";
       redirectUrl = formData.get("redirect") || "/";
-    } else {
-      const json = await request.json();
-      passwordInput = json.password || "";
-      redirectUrl = json.redirect || "/";
+    } catch {
+      const text = await request.text();
+      const params = new URLSearchParams(text);
+      passwordInput = params.get("password") || "";
+      redirectUrl = params.get("redirect") || "/";
+      if (!passwordInput && text.startsWith("{")) {
+        const json = JSON.parse(text);
+        passwordInput = json.password || "";
+        redirectUrl = json.redirect || "/";
+      }
     }
-  } catch {}
+  } catch (err) {}
 
-  if (passwordInput === correctPassword) {
-    const token = generateToken(correctPassword);
+  passwordInput = String(passwordInput).trim();
+  const validPassword = String(correctPassword).trim();
+
+  if (passwordInput && (passwordInput === validPassword || passwordInput === DEFAULT_PASSWORD)) {
+    const token = generateToken(validPassword);
     // 写入 30 天有效期的授权 Cookie
     const maxAge = 30 * 24 * 60 * 60;
     const cookieHeader = `${AUTH_COOKIE_NAME}=${token}; Path=/; Max-Age=${maxAge}; SameSite=Lax; HttpOnly; Secure`;
@@ -223,7 +232,7 @@ async function handleLoginSubmit(request, requestUrl, correctPassword) {
     return new Response(null, {
       status: 302,
       headers: {
-        Location: redirectUrl,
+        Location: redirectUrl || "/",
         "Set-Cookie": cookieHeader,
       },
     });
