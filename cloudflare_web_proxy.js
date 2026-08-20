@@ -407,6 +407,9 @@ function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
           if (_common.replaceToUrl) {
             var origReplaceToUrl = _common.replaceToUrl;
             _common.replaceToUrl = function(url, param) {
+              if (param && typeof param === 'string') {
+                param = param.replace(/singlesignhost=[^&]*/g, "singlesignhost=account.kdocs.cn");
+              }
               return origReplaceToUrl.call(this, wrap(url), param);
             };
           }
