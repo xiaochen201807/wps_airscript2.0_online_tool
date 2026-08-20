@@ -404,43 +404,73 @@ function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
   }
 
   // 劫持 window.common 对象（针对金山 SSO 登录体系的核心全局对象）
-  var _common = undefined;
-  try {
-    Object.defineProperty(window, 'common', {
-      get: function() { return _common; },
-      set: function(val) {
-        _common = val;
-        if (_common && typeof _common === 'object') {
-          // 彻底放行所有回调域名校验
-          _common.checkCallback = function(url) {
-            return url;
-          };
-          if (_common.getDomainUrl) {
-            var origGetDomainUrl = _common.getDomainUrl;
-            _common.getDomainUrl = function() {
-              var url = origGetDomainUrl.apply(this, arguments);
-              return wrap(url);
-            };
-          }
-          if (_common.hrefReplace) {
-            var origHrefReplace = _common.hrefReplace;
-            _common.hrefReplace = function(url) {
-              return origHrefReplace.call(this, wrap(url));
-            };
-          }
-          if (_common.replaceToUrl) {
-            var origReplaceToUrl = _common.replaceToUrl;
-            _common.replaceToUrl = function(url, param) {
-              if (param && typeof param === 'string') {
-                param = param.replace(/singlesignhost=[^&]*/g, "singlesignhost=account.kdocs.cn");
-              }
-              return origReplaceToUrl.call(this, wrap(url), param);
-            };
-          }
+  var _realCommon = {};
+  var commonFallback = {
+    checkCallback: function(url) { return url; },
+    getUrlParams: function(url) {
+      url = url || location.search || location.href;
+      var params = {};
+      try {
+        var str = url.indexOf("?") > -1 ? url.split("?")[1] : url;
+        str = str.split("#")[0];
+        var pairs = str.split("&");
+        for (var i = 0; i < pairs.length; i++) {
+          var p = pairs[i].split("=");
+          if (p[0]) params[decodeURIComponent(p[0])] = decodeURIComponent(p[1] || "");
         }
+      } catch(e) {}
+      return params;
+    },
+    getDomainUrl: function(name, path) {
+      path = path || "";
+      if (name === "account") return wrap("https://account.wps.cn" + path);
+      if (name === "kdocs") return wrap("https://www.kdocs.cn" + path);
+      return wrap("https://www.wps.cn" + path);
+    },
+    getBaseUrl: function() { return PROXY + "/https://account.wps.cn/"; },
+    dwStatistics: function() {},
+    hrefReplace: function(url) { location.href = wrap(url); },
+    replaceToUrl: function(url, param) {
+      if (param && typeof param === 'string') {
+        param = param.replace(/singlesignhost=[^&]*/g, "singlesignhost=account.kdocs.cn");
+      }
+      location.replace(wrap(url + (url.indexOf("?") > -1 ? "&" : "?") + (param || "")));
+    }
+  };
+
+  try {
+    window.common = new Proxy(commonFallback, {
+      get: function(target, prop) {
+        if (prop === 'checkCallback') return function(url) { return url; };
+        if (prop === 'getDomainUrl') {
+          return function() {
+            var fn = _realCommon.getDomainUrl || target.getDomainUrl;
+            return wrap(fn.apply(this, arguments));
+          };
+        }
+        if (prop === 'hrefReplace') {
+          return function(url) {
+            var fn = _realCommon.hrefReplace || target.hrefReplace;
+            return fn.call(this, wrap(url));
+          };
+        }
+        if (prop === 'replaceToUrl') {
+          return function(url, param) {
+            if (param && typeof param === 'string') {
+              param = param.replace(/singlesignhost=[^&]*/g, "singlesignhost=account.kdocs.cn");
+            }
+            var fn = _realCommon.replaceToUrl || target.replaceToUrl;
+            return fn.call(this, wrap(url), param);
+          };
+        }
+        if (prop in _realCommon) return _realCommon[prop];
+        if (prop in target) return target[prop];
+        return function() {};
       },
-      configurable: true,
-      enumerable: true
+      set: function(target, prop, val) {
+        _realCommon[prop] = val;
+        return true;
+      }
     });
   } catch(e) {}
 
