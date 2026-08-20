@@ -1,23 +1,19 @@
 /**
- * Cloudflare Worker - 金山在线文档浏览器代理网关（带安全认证防护版）
+ * Cloudflare Worker - 金山全生态在线文档与账号登录通用代理网关
  * 
- * 🛡️ 认证与防滥用机制：
- * 1. 🔑 密码保护：首次访问需输入访问密码，验证通过后发放安全 Cookie（有效期 30 天，免重复登录）；
- * 2. ⚡ 动静全链路鉴权：支持 WebSocket 协同、静态资源加载及子请求携带 Cookie 自动放行；
- * 3. 🤖 API 友好兼容：支持在 Header 中携带 `X-Proxy-Auth` 或参数 `?auth_key=` 认证；
- * 4. ⚙️ 支持 Cloudflare 环境变量：可在 Worker 控制台「Settings -> Variables」中配置 `PROXY_PASSWORD`，安全无感。
- * 
- * 部署步骤：
- * 1. 登录 Cloudflare 控制台 (https://dash.cloudflare.com)
- * 2. 进入 Worker -> Edit code，覆盖粘贴本代码并点击 Deploy
- * 3. （推荐）在 Worker 的 Settings -> Variables 中添加环境变量 PROXY_PASSWORD，设置你的专属密码
- *    （若未设置环境变量，则默认使用代码中的 DEFAULT_PASSWORD）
+ * 🌟 全面支持：
+ * 1. 📄 在线文档与智能表格：www.kdocs.cn / doc.kdocs.cn / drive.kdocs.cn 等
+ * 2. 🔐 统一身份认证与单点登录 SSO：account.wps.cn / passport.wps.cn / vip.wps.cn / www.wps.cn 等
+ * 3. 🌐 全站动静态资源自动代理与 Client-side 脚本拦截注入（自动劫持 window.open、fetch、a 标签跳转）
+ * 4. 🍪 跨域 SSO Cookie 与 302 重定向全自动重写与映射
+ * 5. 🛡️ 密码访问控制与防滥用认证保护（默认密码：atwasoft）
  */
 
-// 默认备用访问密码（建议在 Cloudflare 环境变量 PROXY_PASSWORD 中配置）
+// 默认备用访问密码（可在 Cloudflare 环境变量 PROXY_PASSWORD 中配置）
 const DEFAULT_PASSWORD = "atwasoft";
 const DEFAULT_TARGET_HOST = "www.kdocs.cn";
 const AUTH_COOKIE_NAME = "_kdocs_proxy_auth";
+const LAST_HOST_COOKIE_NAME = "_kdocs_last_host";
 
 export default {
   async fetch(request, env, ctx) {
@@ -40,18 +36,16 @@ export default {
     const isAuthenticated = checkAuthentication(request, requestUrl, correctPassword);
 
     if (!isAuthenticated) {
-      // 若未认证且为静态资源请求，返回 401
       if (isStaticOrApiRequest(requestUrl)) {
         return new Response("Unauthorized: 请先登录认证代理网关", {
           status: 401,
           headers: { "Content-Type": "text/plain; charset=utf-8" },
         });
       }
-      // 否则展示现代毛玻璃登录验证页面
       return renderLoginPage(requestUrl, workerOrigin);
     }
 
-    // ==================== 2. 正常代理逻辑 ====================
+    // ==================== 2. 正常代理路由 ====================
     // 如果是首页且无目标参数，展示已登录的 Web 导航门户
     if (requestUrl.pathname === "/" && !requestUrl.searchParams.has("url")) {
       return renderPortalPage(workerOrigin);
@@ -94,12 +88,13 @@ export default {
     const newHeaders = new Headers(request.headers);
     newHeaders.set("Host", targetUrl.host);
     newHeaders.set("Origin", targetUrl.origin);
-    newHeaders.set("Referer", targetUrl.toString());
+    newHeaders.set("Referer", targetUrl.origin + "/");
 
     newHeaders.delete("cf-connecting-ip");
     newHeaders.delete("cf-ipcountry");
     newHeaders.delete("cf-ray");
     newHeaders.delete("cf-visitor");
+    newHeaders.delete("X-Proxy-Auth");
 
     const proxyRequest = new Request(targetUrl.toString(), {
       method: request.method,
@@ -116,7 +111,14 @@ export default {
       modifiedHeaders.set("Access-Control-Allow-Origin", "*");
       modifiedHeaders.set("Access-Control-Allow-Credentials", "true");
 
-      // 重写 301 / 302 重定向目标
+      // 记录当前访问的 Host，方便后续相对路径定位
+      const currentHost = targetUrl.host;
+      modifiedHeaders.append(
+        "Set-Cookie",
+        `${LAST_HOST_COOKIE_NAME}=${currentHost}; Path=/; SameSite=Lax; HttpOnly; Secure`
+      );
+
+      // 重写 301 / 302 / 307 重定向目标（特别是 SSO 登录与回调）
       const location = modifiedHeaders.get("Location");
       if (location) {
         let redirectTarget;
@@ -125,13 +127,21 @@ export default {
         } catch {
           redirectTarget = location;
         }
+
+        // 如果重定向包含了 cb= 或 redirect_url= 回调，把里面的金山地址也代理化
+        redirectTarget = rewriteCallbackUrls(redirectTarget, workerOrigin);
         modifiedHeaders.set("Location", `${workerOrigin}/${redirectTarget}`);
       }
 
-      // 重写 Set-Cookie 域
+      // 重写 Set-Cookie（剥离原站 Domain 限制，确保在当前 Worker 代理域下生效）
       const cookies = response.headers.getSetCookie ? response.headers.getSetCookie() : [];
       if (cookies.length > 0) {
         modifiedHeaders.delete("Set-Cookie");
+        // 重新添加记录 host 的 cookie
+        modifiedHeaders.append(
+          "Set-Cookie",
+          `${LAST_HOST_COOKIE_NAME}=${currentHost}; Path=/; SameSite=Lax; HttpOnly; Secure`
+        );
         for (const cookie of cookies) {
           const rewrittenCookie = cookie
             .replace(/domain=[^;]+;?/gi, "")
@@ -143,13 +153,25 @@ export default {
       modifiedHeaders.delete("X-Frame-Options");
       modifiedHeaders.delete("Content-Security-Policy");
 
+      // 若为 HTML 页面，进行内容替换并注入客户端拦截脚本
+      const contentType = modifiedHeaders.get("Content-Type") || "";
+      if (contentType.includes("text/html")) {
+        let htmlText = await response.text();
+        htmlText = injectProxyInterceptorScript(htmlText, workerOrigin, targetUrl.origin);
+        return new Response(htmlText, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: modifiedHeaders,
+        });
+      }
+
       return new Response(response.body, {
         status: response.status,
         statusText: response.statusText,
         headers: modifiedHeaders,
       });
     } catch (err) {
-      return new Response("代理访问金山在线文档失败: " + err.message, {
+      return new Response("代理访问金山在线服务失败: " + err.message, {
         status: 502,
         headers: { "Content-Type": "text/plain; charset=utf-8" },
       });
@@ -157,33 +179,188 @@ export default {
   },
 };
 
-// ==================== 认证辅助逻辑 ====================
+// ==================== URL 与回调重写逻辑 ====================
+
+function rewriteCallbackUrls(urlStr, workerOrigin) {
+  try {
+    const u = new URL(urlStr);
+    for (const key of ["cb", "redirect", "redirect_url", "target", "return_url"]) {
+      if (u.searchParams.has(key)) {
+        const origCb = u.searchParams.get(key);
+        if (origCb.startsWith("http://") || origCb.startsWith("https://")) {
+          u.searchParams.set(key, `${workerOrigin}/${origCb}`);
+        }
+      }
+    }
+    return u.toString();
+  } catch {
+    return urlStr;
+  }
+}
+
+function extractTargetUrl(requestUrl, request) {
+  // 1. 通过 ?url= 参数
+  if (requestUrl.searchParams.has("url")) {
+    return requestUrl.searchParams.get("url");
+  }
+
+  // 2. 通过路径前缀提取 https://worker.dev/https://account.wps.cn/xxx
+  let pathname = requestUrl.pathname.slice(1);
+  if (pathname.startsWith("http://") || pathname.startsWith("https://")) {
+    return pathname + requestUrl.search;
+  }
+  if (pathname.startsWith("http:/") && !pathname.startsWith("http://")) {
+    return pathname.replace("http:/", "http://") + requestUrl.search;
+  }
+  if (pathname.startsWith("https:/") && !pathname.startsWith("https://")) {
+    return pathname.replace("https:/", "https://") + requestUrl.search;
+  }
+
+  // 3. 根据路径特征智能推断金山子系统
+  const pathLower = requestUrl.pathname.toLowerCase();
+  if (
+    pathLower.startsWith("/passport") ||
+    pathLower.startsWith("/sso") ||
+    pathLower.startsWith("/auth") ||
+    pathLower.startsWith("/api/v4/user") ||
+    pathLower.startsWith("/api/v3/user")
+  ) {
+    return `https://account.wps.cn${requestUrl.pathname}${requestUrl.search}`;
+  }
+
+  // 4. 从 Referer 提取 Host
+  const referer = request.headers.get("Referer");
+  if (referer) {
+    try {
+      const refUrl = new URL(referer);
+      const extractedHost = extractHostFromReferer(refUrl);
+      if (extractedHost) {
+        return `https://${extractedHost}${requestUrl.pathname}${requestUrl.search}`;
+      }
+    } catch {}
+  }
+
+  // 5. 从 Cookie _kdocs_last_host 中获取最近访问的 Host
+  const cookieHeader = request.headers.get("Cookie") || "";
+  const lastHost = getCookieValue(cookieHeader, LAST_HOST_COOKIE_NAME);
+  if (lastHost && isValidWpsHost(lastHost)) {
+    return `https://${lastHost}${requestUrl.pathname}${requestUrl.search}`;
+  }
+
+  return `https://${DEFAULT_TARGET_HOST}${requestUrl.pathname}${requestUrl.search}`;
+}
+
+function isValidWpsHost(host) {
+  return (
+    host.endsWith("wps.cn") ||
+    host.endsWith("kdocs.cn") ||
+    host.endsWith("kingsoft.net") ||
+    host.endsWith("wpscdn.cn")
+  );
+}
+
+function extractHostFromReferer(refUrl) {
+  let p = refUrl.pathname.slice(1);
+  if (p.startsWith("http://") || p.startsWith("https://")) {
+    try {
+      return new URL(p).host;
+    } catch {}
+  }
+  return null;
+}
+
+// ==================== 客户端拦截脚本注入 ====================
+
+function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
+  const interceptorScript = `
+<script>
+(function() {
+  var PROXY_ORIGIN = "${workerOrigin}";
+  
+  function wrapUrl(url) {
+    if (!url || typeof url !== 'string') return url;
+    if (url.startsWith('//')) url = 'https:' + url;
+    if (url.startsWith('https://account.wps.cn') ||
+        url.startsWith('https://passport.wps.cn') ||
+        url.startsWith('https://www.wps.cn') ||
+        url.startsWith('https://vip.wps.cn') ||
+        url.startsWith('https://www.kdocs.cn') ||
+        url.startsWith('https://doc.kdocs.cn') ||
+        url.startsWith('https://drive.kdocs.cn') ||
+        url.indexOf('.kdocs.cn') !== -1 ||
+        url.indexOf('.wps.cn') !== -1) {
+      if (!url.startsWith(PROXY_ORIGIN)) {
+        return PROXY_ORIGIN + '/' + url;
+      }
+    }
+    return url;
+  }
+
+  // 劫持 window.open
+  var origOpen = window.open;
+  window.open = function(url, target, features) {
+    return origOpen.call(window, wrapUrl(url), target, features);
+  };
+
+  // 劫持 fetch
+  var origFetch = window.fetch;
+  window.fetch = function(input, init) {
+    if (typeof input === 'string') {
+      input = wrapUrl(input);
+    } else if (input instanceof Request) {
+      input = new Request(wrapUrl(input.url), input);
+    }
+    return origFetch.call(window, input, init);
+  };
+
+  // 劫持 XMLHttpRequest
+  var origXhrOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
+    return origXhrOpen.call(this, method, wrapUrl(url), async, user, password);
+  };
+
+  // 全局拦截链接点击
+  document.addEventListener('click', function(e) {
+    var target = e.target;
+    while (target && target.tagName !== 'A') {
+      target = target.parentElement;
+    }
+    if (target && target.href) {
+      var wrapped = wrapUrl(target.href);
+      if (wrapped !== target.href) {
+        target.href = wrapped;
+      }
+    }
+  }, true);
+})();
+</script>
+`;
+
+  if (html.includes("</head>")) {
+    return html.replace("</head>", interceptorScript + "</head>");
+  } else if (html.includes("<head>")) {
+    return html.replace("<head>", "<head>" + interceptorScript);
+  }
+  return interceptorScript + html;
+}
+
+// ==================== 认证逻辑 ====================
 
 function checkAuthentication(request, requestUrl, correctPassword) {
-  // 1. 通过请求头 X-Proxy-Auth 认证（适用于 API 客户端）
   const headerAuth = request.headers.get("X-Proxy-Auth");
-  if (headerAuth && headerAuth === correctPassword) {
-    return true;
-  }
+  if (headerAuth && headerAuth === correctPassword) return true;
 
-  // 2. 通过 URL 参数 ?auth_key= 认证
   const queryAuth = requestUrl.searchParams.get("auth_key");
-  if (queryAuth && queryAuth === correctPassword) {
-    return true;
-  }
+  if (queryAuth && queryAuth === correctPassword) return true;
 
-  // 3. 通过 Cookie 认证
   const cookieHeader = request.headers.get("Cookie") || "";
   const token = getCookieValue(cookieHeader, AUTH_COOKIE_NAME);
-  if (token && token === generateToken(correctPassword)) {
-    return true;
-  }
+  if (token && token === generateToken(correctPassword)) return true;
 
   return false;
 }
 
 function generateToken(password) {
-  // 基于密码生成简易校验签名
   let hash = 0;
   for (let i = 0; i < password.length; i++) {
     hash = (hash << 5) - hash + password.charCodeAt(i);
@@ -225,7 +402,6 @@ async function handleLoginSubmit(request, requestUrl, correctPassword) {
 
   if (passwordInput && (passwordInput === validPassword || passwordInput === DEFAULT_PASSWORD)) {
     const token = generateToken(validPassword);
-    // 写入 30 天有效期的授权 Cookie
     const maxAge = 30 * 24 * 60 * 60;
     const cookieHeader = `${AUTH_COOKIE_NAME}=${token}; Path=/; Max-Age=${maxAge}; SameSite=Lax; HttpOnly; Secure`;
 
@@ -237,14 +413,12 @@ async function handleLoginSubmit(request, requestUrl, correctPassword) {
       },
     });
   } else {
-    // 密码错误，返回带错误提示的登录页
     const workerOrigin = requestUrl.origin;
     return renderLoginPage(requestUrl, workerOrigin, "❌ 密码错误，请重新输入！", redirectUrl);
   }
 }
 
 function handleLogout(requestUrl) {
-  // 清理 Cookie
   const cookieHeader = `${AUTH_COOKIE_NAME}=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly; Secure`;
   return new Response(null, {
     status: 302,
@@ -268,47 +442,7 @@ function isStaticOrApiRequest(url) {
   );
 }
 
-// ==================== URL 解析与代理 ====================
-
-function extractTargetUrl(requestUrl, request) {
-  if (requestUrl.searchParams.has("url")) {
-    return requestUrl.searchParams.get("url");
-  }
-
-  let pathname = requestUrl.pathname.slice(1);
-  if (pathname.startsWith("http://") || pathname.startsWith("https://")) {
-    return pathname + requestUrl.search;
-  }
-  if (pathname.startsWith("http:/") && !pathname.startsWith("http://")) {
-    return pathname.replace("http:/", "http://") + requestUrl.search;
-  }
-  if (pathname.startsWith("https:/") && !pathname.startsWith("https://")) {
-    return pathname.replace("https:/", "https://") + requestUrl.search;
-  }
-
-  const referer = request.headers.get("Referer");
-  if (referer) {
-    try {
-      const refUrl = new URL(referer);
-      const extractedHost = extractHostFromReferer(refUrl);
-      if (extractedHost) {
-        return `https://${extractedHost}${requestUrl.pathname}${requestUrl.search}`;
-      }
-    } catch {}
-  }
-
-  return `https://${DEFAULT_TARGET_HOST}${requestUrl.pathname}${requestUrl.search}`;
-}
-
-function extractHostFromReferer(refUrl) {
-  let p = refUrl.pathname.slice(1);
-  if (p.startsWith("http://") || p.startsWith("https://")) {
-    try {
-      return new URL(p).host;
-    } catch {}
-  }
-  return DEFAULT_TARGET_HOST;
-}
+// ==================== WebSocket 与 UI 渲染 ====================
 
 async function handleWebSocket(request, targetUrl) {
   const wsUrl = new URL(targetUrl);
@@ -321,8 +455,6 @@ async function handleWebSocket(request, targetUrl) {
     headers: newHeaders,
   });
 }
-
-// ==================== UI 界面渲染 ====================
 
 function renderLoginPage(requestUrl, workerOrigin, errorMsg = "", targetRedirect = "") {
   const redirectTarget = targetRedirect || requestUrl.pathname + requestUrl.search;
@@ -344,7 +476,6 @@ function renderLoginPage(requestUrl, workerOrigin, errorMsg = "", targetRedirect
       --accent-hover: #2563eb;
       --text: #f1f5f9;
       --text-muted: #94a3b8;
-      --danger: #ef4444;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -381,17 +512,8 @@ function renderLoginPage(requestUrl, workerOrigin, errorMsg = "", targetRedirect
       margin-bottom: 20px;
       color: #60a5fa;
     }
-    h1 {
-      font-size: 22px;
-      font-weight: 700;
-      margin-bottom: 8px;
-    }
-    p {
-      color: var(--text-muted);
-      font-size: 13.5px;
-      line-height: 1.5;
-      margin-bottom: 24px;
-    }
+    h1 { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
+    p { color: var(--text-muted); font-size: 13.5px; line-height: 1.5; margin-bottom: 24px; }
     .error-box {
       background: rgba(239, 68, 68, 0.15);
       border: 1px solid rgba(239, 68, 68, 0.3);
@@ -402,11 +524,7 @@ function renderLoginPage(requestUrl, workerOrigin, errorMsg = "", targetRedirect
       margin-bottom: 20px;
       text-align: left;
     }
-    form {
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-    }
+    form { display: flex; flex-direction: column; gap: 16px; }
     .input-field {
       width: 100%;
       background: rgba(15, 23, 42, 0.9);
@@ -433,10 +551,7 @@ function renderLoginPage(requestUrl, workerOrigin, errorMsg = "", targetRedirect
       cursor: pointer;
       transition: all 0.2s;
     }
-    .btn:hover {
-      opacity: 0.92;
-      transform: translateY(-1px);
-    }
+    .btn:hover { opacity: 0.92; transform: translateY(-1px); }
   </style>
 </head>
 <body>
@@ -445,7 +560,7 @@ function renderLoginPage(requestUrl, workerOrigin, errorMsg = "", targetRedirect
       <svg width="28" height="28" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
     </div>
     <h1>访问权限验证</h1>
-    <p>该网关服务受密码保护，请输入访问密码以继续使用金山在线文档代理。</p>
+    <p>该网关服务受密码保护，请输入访问密码以继续使用金山在线服务。</p>
 
     ${errorMsg ? `<div class="error-box">${errorMsg}</div>` : ""}
 
@@ -470,7 +585,7 @@ function renderPortalPage(workerOrigin) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>金山在线文档 - 浏览器代理访问网关</title>
+  <title>金山在线服务 - 浏览器代理访问网关</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
@@ -533,9 +648,7 @@ function renderPortalPage(workerOrigin) {
       gap: 4px;
       transition: color 0.2s;
     }
-    .logout-btn:hover {
-      color: #f87171;
-    }
+    .logout-btn:hover { color: #f87171; }
     h1 {
       font-size: 26px;
       font-weight: 700;
@@ -589,8 +702,27 @@ function renderPortalPage(workerOrigin) {
       opacity: 0.92;
       transform: translateY(-1px);
     }
+    .quick-links {
+      display: flex;
+      gap: 10px;
+      margin-top: 18px;
+    }
+    .quick-link {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      padding: 8px 14px;
+      border-radius: 8px;
+      color: #93c5fd;
+      text-decoration: none;
+      font-size: 13px;
+      transition: all 0.2s;
+    }
+    .quick-link:hover {
+      background: rgba(59, 130, 246, 0.2);
+      border-color: rgba(59, 130, 246, 0.4);
+    }
     .tips {
-      margin-top: 30px;
+      margin-top: 26px;
       border-top: 1px solid var(--border);
       padding-top: 20px;
     }
@@ -617,22 +749,27 @@ function renderPortalPage(workerOrigin) {
 <body>
   <div class="container">
     <div class="header-bar">
-      <div class="badge">🛡️ 已通过认证 | 安全代理</div>
+      <div class="badge">🛡️ 全生态代理已激活</div>
       <a href="/__proxy_logout__" class="logout-btn">
         <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
         <span>退出登录</span>
       </a>
     </div>
 
-    <h1>金山在线文档浏览器代理网关</h1>
-    <p class="desc">专为企业局域网/网络受限环境设计，粘贴任意金山文档（智能表格/文字/演示）链接，一键穿透直达！</p>
+    <h1>金山文档 / 账号登录代理网关</h1>
+    <p class="desc">支持智能表格、金山文档及账号登录中心（account.wps.cn），全链路穿透直达！</p>
     
     <div class="input-group">
-      <input type="text" id="docUrl" class="input-box" placeholder="粘贴金山文档链接，如 https://www.kdocs.cn/l/co63t9c3u9Q3" />
+      <input type="text" id="docUrl" class="input-box" placeholder="粘贴链接，如 https://www.kdocs.cn/l/co63t9c3u9Q3 或 https://account.wps.cn" />
       <button class="btn" onclick="openProxy()">
         <span>立即前往访问</span>
         <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"/></svg>
       </button>
+    </div>
+
+    <div class="quick-links">
+      <a class="quick-link" href="${workerOrigin}/https://www.kdocs.cn" target="_blank">📑 金山文档首页</a>
+      <a class="quick-link" href="${workerOrigin}/https://account.wps.cn" target="_blank">🔐 WPS 账号中心</a>
     </div>
 
     <div class="tips">
@@ -645,7 +782,7 @@ function renderPortalPage(workerOrigin) {
     function openProxy() {
       var val = document.getElementById("docUrl").value.trim();
       if (!val) {
-        alert("请先粘贴金山文档完整 URL 链接！");
+        alert("请先粘贴金山文档或账号中心完整 URL 链接！");
         return;
       }
       if (!val.startsWith("http://") && !val.startsWith("https://")) {
