@@ -184,6 +184,17 @@ export default {
         });
       }
 
+      // 若为 JS 文件，对其中硬编码的金山域名进行代理前缀替换
+      if (contentType.includes("javascript")) {
+        let jsText = await response.text();
+        jsText = rewriteJsContent(jsText, workerOrigin);
+        return new Response(jsText, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: modifiedHeaders,
+        });
+      }
+
       return new Response(response.body, {
         status: response.status,
         statusText: response.statusText,
@@ -353,6 +364,40 @@ function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
     if (isWps(url)) return PROXY + '/' + url;
     return url;
   }
+
+  // 劫持 window.common 对象（针对金山 SSO 登录体系的核心全局对象）
+  var _common = undefined;
+  try {
+    Object.defineProperty(window, 'common', {
+      get: function() { return _common; },
+      set: function(val) {
+        _common = val;
+        if (_common && typeof _common === 'object') {
+          if (_common.getDomainUrl) {
+            var origGetDomainUrl = _common.getDomainUrl;
+            _common.getDomainUrl = function() {
+              var url = origGetDomainUrl.apply(this, arguments);
+              return wrap(url);
+            };
+          }
+          if (_common.hrefReplace) {
+            var origHrefReplace = _common.hrefReplace;
+            _common.hrefReplace = function(url) {
+              return origHrefReplace.call(this, wrap(url));
+            };
+          }
+          if (_common.replaceToUrl) {
+            var origReplaceToUrl = _common.replaceToUrl;
+            _common.replaceToUrl = function(url, param) {
+              return origReplaceToUrl.call(this, wrap(url), param);
+            };
+          }
+        }
+      },
+      configurable: true,
+      enumerable: true
+    });
+  } catch(e) {}
 
   // window.open
   const _open = window.open;
