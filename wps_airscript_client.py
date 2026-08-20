@@ -18,7 +18,7 @@ from typing import Dict, Any, Optional, List
 class WPSAirScriptClient:
     """WPS 智能表格 AirScript API 客户端"""
     
-    def __init__(self, file_id: str, token: str, script_id: str, base_url: str = "https://www.kdocs.cn"):
+    def __init__(self, file_id: str, token: str, script_id: str, base_url: str = "https://www.kdocs.cn", proxy_password: str = ""):
         """
         初始化 API 客户端
 
@@ -27,18 +27,23 @@ class WPSAirScriptClient:
             token: AirScript Token
             script_id: 脚本id
             base_url: API 基础 URL，默认为 https://www.kdocs.cn
+            proxy_password: 自定义反向代理密码（若使用了带认证的 Cloudflare Worker 代理）
         """
         self.file_id = file_id
         self.token = token
         self.script_id = script_id
         self.base_url = base_url.rstrip('/')
+        self.proxy_password = proxy_password
 
     def _get_headers(self) -> Dict[str, str]:
         """获取请求头"""
-        return {
+        headers = {
             'Content-Type': 'application/json',
             'AirScript-Token': self.token
         }
+        if self.proxy_password:
+            headers['X-Proxy-Auth'] = self.proxy_password
+        return headers
 
     def _request(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """

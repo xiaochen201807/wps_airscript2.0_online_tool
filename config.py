@@ -53,6 +53,11 @@ def get_wps_base_url(default: str = "https://www.kdocs.cn") -> str:
     return os.getenv("WPS_BASE_URL", default).rstrip('/')
 
 
+def get_wps_proxy_password(default: str = "") -> str:
+    """获取自定义反向代理网关的访问密码"""
+    return os.getenv("PROXY_PASSWORD", default)
+
+
 def get_wps_token(default: str = "your_token_here") -> str:
     """获取 WPS AirScript 统一 Token"""
     return os.getenv("WPS_TOKEN", default)

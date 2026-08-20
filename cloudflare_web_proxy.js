@@ -1,34 +1,63 @@
 /**
- * Cloudflare Worker - 金山在线文档浏览器通用代理网关
+ * Cloudflare Worker - 金山在线文档浏览器代理网关（带安全认证防护版）
  * 
- * 功能亮点：
- * 1. 🔗 支持 URL 拼接直接访问：
- *    格式：https://<你的Worker域名>/https://www.kdocs.cn/l/xxxxxx
- * 2. 🖥️ 自带现代化极简 Web 门户：直接访问根路径展示输入框，粘贴任意金山链接一键直达！
- * 3. 🔄 智能相对资源重定向：自动通过 Referer / Cookie 锁定目标 Host，无缝加载各类 JS、CSS、图片与 API。
- * 4. 🍪 完整的 Cookie 与 Location 重写：支持登录状态保持、跨域鉴权与 302 重定向重写。
- * 5. ⚡ WebSocket 实时协作代理：支持多人在智能表格中实时协同编辑。
+ * 🛡️ 认证与防滥用机制：
+ * 1. 🔑 密码保护：首次访问需输入访问密码，验证通过后发放安全 Cookie（有效期 30 天，免重复登录）；
+ * 2. ⚡ 动静全链路鉴权：支持 WebSocket 协同、静态资源加载及子请求携带 Cookie 自动放行；
+ * 3. 🤖 API 友好兼容：支持在 Header 中携带 `X-Proxy-Auth` 或参数 `?auth_key=` 认证；
+ * 4. ⚙️ 支持 Cloudflare 环境变量：可在 Worker 控制台「Settings -> Variables」中配置 `PROXY_PASSWORD`，安全无感。
  * 
  * 部署步骤：
  * 1. 登录 Cloudflare 控制台 (https://dash.cloudflare.com)
- * 2. Workers & Pages -> Create Application -> Create Worker (如命名为 kdocs-web)
- * 3. 点击 Edit code，全选覆盖粘贴本代码，点击 Deploy
- * 4. 浏览器打开分配的 Worker 域名即可使用！
+ * 2. 进入 Worker -> Edit code，覆盖粘贴本代码并点击 Deploy
+ * 3. （推荐）在 Worker 的 Settings -> Variables 中添加环境变量 PROXY_PASSWORD，设置你的专属密码
+ *    （若未设置环境变量，则默认使用代码中的 DEFAULT_PASSWORD）
  */
 
+// 默认备用访问密码（建议在 Cloudflare 环境变量 PROXY_PASSWORD 中配置）
+const DEFAULT_PASSWORD = "MySecretPassword2026";
 const DEFAULT_TARGET_HOST = "www.kdocs.cn";
+const AUTH_COOKIE_NAME = "_kdocs_proxy_auth";
 
 export default {
   async fetch(request, env, ctx) {
     const requestUrl = new URL(request.url);
     const workerOrigin = requestUrl.origin;
+    const correctPassword = (env && env.PROXY_PASSWORD) || DEFAULT_PASSWORD;
 
-    // 1. 如果是首页且无参数，返回美观的前端输入门户
+    // ==================== 1. 认证状态检查 ====================
+    // 处理登录表单提交请求 POST /__proxy_login__
+    if (requestUrl.pathname === "/__proxy_login__" && request.method === "POST") {
+      return handleLoginSubmit(request, requestUrl, correctPassword);
+    }
+
+    // 处理退出登录 GET /__proxy_logout__
+    if (requestUrl.pathname === "/__proxy_logout__") {
+      return handleLogout(requestUrl);
+    }
+
+    // 校验当前请求是否已通过认证
+    const isAuthenticated = checkAuthentication(request, requestUrl, correctPassword);
+
+    if (!isAuthenticated) {
+      // 若未认证且为静态资源请求，返回 401
+      if (isStaticOrApiRequest(requestUrl)) {
+        return new Response("Unauthorized: 请先登录认证代理网关", {
+          status: 401,
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+        });
+      }
+      // 否则展示现代毛玻璃登录验证页面
+      return renderLoginPage(requestUrl, workerOrigin);
+    }
+
+    // ==================== 2. 正常代理逻辑 ====================
+    // 如果是首页且无目标参数，展示已登录的 Web 导航门户
     if (requestUrl.pathname === "/" && !requestUrl.searchParams.has("url")) {
       return renderPortalPage(workerOrigin);
     }
 
-    // 2. 解析实际的目标 URL
+    // 解析目标 URL
     let targetUrlStr = extractTargetUrl(requestUrl, request);
     if (!targetUrlStr) {
       return new Response("无效的目标 URL 请求", { status: 400 });
@@ -41,13 +70,13 @@ export default {
       return new Response("无法解析目标 URL: " + targetUrlStr, { status: 400 });
     }
 
-    // 3. 处理 WebSocket 协同升级请求 (实时在线表格编辑)
+    // 处理 WebSocket 协同升级请求
     const upgradeHeader = request.headers.get("Upgrade");
     if (upgradeHeader && upgradeHeader.toLowerCase() === "websocket") {
       return handleWebSocket(request, targetUrl);
     }
 
-    // 4. 处理 CORS OPTIONS 预检
+    // 处理 CORS 预检
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -61,13 +90,12 @@ export default {
       });
     }
 
-    // 5. 构造转发请求头
+    // 构造转发请求头
     const newHeaders = new Headers(request.headers);
     newHeaders.set("Host", targetUrl.host);
     newHeaders.set("Origin", targetUrl.origin);
     newHeaders.set("Referer", targetUrl.toString());
 
-    // 移除导致反向代理问题的部分专有头
     newHeaders.delete("cf-connecting-ip");
     newHeaders.delete("cf-ipcountry");
     newHeaders.delete("cf-ray");
@@ -77,13 +105,13 @@ export default {
       method: request.method,
       headers: newHeaders,
       body: ["GET", "HEAD"].includes(request.method) ? undefined : request.body,
-      redirect: "manual", // 手动处理 301/302 重定向
+      redirect: "manual",
     });
 
     try {
       const response = await fetch(proxyRequest);
 
-      // 6. 构造客户端响应，重写 Headers (Location / Set-Cookie / CORS)
+      // 重写响应头
       const modifiedHeaders = new Headers(response.headers);
       modifiedHeaders.set("Access-Control-Allow-Origin": "*");
       modifiedHeaders.set("Access-Control-Allow-Credentials": "true");
@@ -105,7 +133,6 @@ export default {
       if (cookies.length > 0) {
         modifiedHeaders.delete("Set-Cookie");
         for (const cookie of cookies) {
-          // 清理 domain 限制，使 cookie 作用于当前 proxy 域
           const rewrittenCookie = cookie
             .replace(/domain=[^;]+;?/gi, "")
             .replace(/SameSite=None/gi, "SameSite=Lax");
@@ -113,7 +140,6 @@ export default {
         }
       }
 
-      // 允许在 iframe 中展示（移除 frame 限制）
       modifiedHeaders.delete("X-Frame-Options");
       modifiedHeaders.delete("Content-Security-Policy");
 
@@ -131,17 +157,116 @@ export default {
   },
 };
 
-/**
- * 提取目标 URL
- */
+// ==================== 认证辅助逻辑 ====================
+
+function checkAuthentication(request, requestUrl, correctPassword) {
+  // 1. 通过请求头 X-Proxy-Auth 认证（适用于 API 客户端）
+  const headerAuth = request.headers.get("X-Proxy-Auth");
+  if (headerAuth && headerAuth === correctPassword) {
+    return true;
+  }
+
+  // 2. 通过 URL 参数 ?auth_key= 认证
+  const queryAuth = requestUrl.searchParams.get("auth_key");
+  if (queryAuth && queryAuth === correctPassword) {
+    return true;
+  }
+
+  // 3. 通过 Cookie 认证
+  const cookieHeader = request.headers.get("Cookie") || "";
+  const token = getCookieValue(cookieHeader, AUTH_COOKIE_NAME);
+  if (token && token === generateToken(correctPassword)) {
+    return true;
+  }
+
+  return false;
+}
+
+function generateToken(password) {
+  // 基于密码生成简易校验签名
+  let hash = 0;
+  for (let i = 0; i < password.length; i++) {
+    hash = (hash << 5) - hash + password.charCodeAt(i);
+    hash |= 0;
+  }
+  return "auth_" + Math.abs(hash).toString(36);
+}
+
+function getCookieValue(cookieString, name) {
+  const match = cookieString.match(new RegExp("(^|;\\s*)" + name + "=([^;]*)"));
+  return match ? decodeURIComponent(match[2]) : null;
+}
+
+async function handleLoginSubmit(request, requestUrl, correctPassword) {
+  let passwordInput = "";
+  let redirectUrl = "/";
+
+  try {
+    const contentType = request.headers.get("Content-Type") || "";
+    if (contentType.includes("application/x-www-form-urlencoded")) {
+      const formData = await request.formData();
+      passwordInput = formData.get("password") || "";
+      redirectUrl = formData.get("redirect") || "/";
+    } else {
+      const json = await request.json();
+      passwordInput = json.password || "";
+      redirectUrl = json.redirect || "/";
+    }
+  } catch {}
+
+  if (passwordInput === correctPassword) {
+    const token = generateToken(correctPassword);
+    // 写入 30 天有效期的授权 Cookie
+    const maxAge = 30 * 24 * 60 * 60;
+    const cookieHeader = `${AUTH_COOKIE_NAME}=${token}; Path=/; Max-Age=${maxAge}; SameSite=Lax; HttpOnly; Secure`;
+
+    return new Response(null, {
+      status: 302,
+      headers: {
+        Location: redirectUrl,
+        "Set-Cookie": cookieHeader,
+      },
+    });
+  } else {
+    // 密码错误，返回带错误提示的登录页
+    const workerOrigin = requestUrl.origin;
+    return renderLoginPage(requestUrl, workerOrigin, "❌ 密码错误，请重新输入！", redirectUrl);
+  }
+}
+
+function handleLogout(requestUrl) {
+  // 清理 Cookie
+  const cookieHeader = `${AUTH_COOKIE_NAME}=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly; Secure`;
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: "/",
+      "Set-Cookie": cookieHeader,
+    },
+  });
+}
+
+function isStaticOrApiRequest(url) {
+  const path = url.pathname.toLowerCase();
+  return (
+    path.endsWith(".js") ||
+    path.endsWith(".css") ||
+    path.endsWith(".png") ||
+    path.endsWith(".jpg") ||
+    path.endsWith(".svg") ||
+    path.endsWith(".woff2") ||
+    path.startsWith("/api/")
+  );
+}
+
+// ==================== URL 解析与代理 ====================
+
 function extractTargetUrl(requestUrl, request) {
-  // 方式 A：通过 query 参数 ?url=...
   if (requestUrl.searchParams.has("url")) {
     return requestUrl.searchParams.get("url");
   }
 
-  // 方式 B：通过路径前缀提取 https://worker.dev/https://www.kdocs.cn/xxx
-  let pathname = requestUrl.pathname.slice(1); // 去掉开头的 /
+  let pathname = requestUrl.pathname.slice(1);
   if (pathname.startsWith("http://") || pathname.startsWith("https://")) {
     return pathname + requestUrl.search;
   }
@@ -152,12 +277,10 @@ function extractTargetUrl(requestUrl, request) {
     return pathname.replace("https:/", "https://") + requestUrl.search;
   }
 
-  // 方式 C：相对静态资源/接口，通过 Referer 智能回推源站 Host
   const referer = request.headers.get("Referer");
   if (referer) {
     try {
       const refUrl = new URL(referer);
-      // 如果 referer 是代理地址（如 https://worker.dev/https://www.kdocs.cn/...）
       const extractedHost = extractHostFromReferer(refUrl);
       if (extractedHost) {
         return `https://${extractedHost}${requestUrl.pathname}${requestUrl.search}`;
@@ -165,7 +288,6 @@ function extractTargetUrl(requestUrl, request) {
     } catch {}
   }
 
-  // 方式 D：默认 fallback 到金山官方域名
   return `https://${DEFAULT_TARGET_HOST}${requestUrl.pathname}${requestUrl.search}`;
 }
 
@@ -179,9 +301,6 @@ function extractHostFromReferer(refUrl) {
   return DEFAULT_TARGET_HOST;
 }
 
-/**
- * WebSocket 转发支持
- */
 async function handleWebSocket(request, targetUrl) {
   const wsUrl = new URL(targetUrl);
   wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
@@ -194,9 +313,148 @@ async function handleWebSocket(request, targetUrl) {
   });
 }
 
-/**
- * 现代极简 Web 门户页面
- */
+// ==================== UI 界面渲染 ====================
+
+function renderLoginPage(requestUrl, workerOrigin, errorMsg = "", targetRedirect = "") {
+  const redirectTarget = targetRedirect || requestUrl.pathname + requestUrl.search;
+
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>安全认证 - 金山文档代理网关</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #090d16;
+      --card-bg: rgba(22, 30, 46, 0.85);
+      --border: rgba(255, 255, 255, 0.1);
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --text: #f1f5f9;
+      --text-muted: #94a3b8;
+      --danger: #ef4444;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(circle at 50% 10%, #1e293b 0%, var(--bg) 70%);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 20px;
+    }
+    .card {
+      width: 100%;
+      max-width: 420px;
+      background: var(--card-bg);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 36px 32px;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6);
+      text-align: center;
+    }
+    .icon {
+      width: 56px;
+      height: 56px;
+      background: rgba(59, 130, 246, 0.15);
+      border: 1px solid rgba(59, 130, 246, 0.3);
+      border-radius: 16px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 20px;
+      color: #60a5fa;
+    }
+    h1 {
+      font-size: 22px;
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+    p {
+      color: var(--text-muted);
+      font-size: 13.5px;
+      line-height: 1.5;
+      margin-bottom: 24px;
+    }
+    .error-box {
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      color: #fca5a5;
+      padding: 10px 14px;
+      border-radius: 10px;
+      font-size: 13px;
+      margin-bottom: 20px;
+      text-align: left;
+    }
+    form {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .input-field {
+      width: 100%;
+      background: rgba(15, 23, 42, 0.9);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 12px;
+      padding: 14px 16px;
+      color: #fff;
+      font-size: 15px;
+      outline: none;
+      transition: all 0.2s;
+    }
+    .input-field:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
+    }
+    .btn {
+      background: linear-gradient(135deg, var(--accent), var(--accent-hover));
+      color: #fff;
+      border: none;
+      border-radius: 12px;
+      padding: 14px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn:hover {
+      opacity: 0.92;
+      transform: translateY(-1px);
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">
+      <svg width="28" height="28" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
+    </div>
+    <h1>访问权限验证</h1>
+    <p>该网关服务受密码保护，请输入访问密码以继续使用金山在线文档代理。</p>
+
+    ${errorMsg ? `<div class="error-box">${errorMsg}</div>` : ""}
+
+    <form action="/__proxy_login__" method="POST">
+      <input type="hidden" name="redirect" value="${redirectTarget}" />
+      <input type="password" name="password" class="input-field" placeholder="请输入专属访问密码..." required autofocus />
+      <button type="submit" class="btn">验证并进入</button>
+    </form>
+  </div>
+</body>
+</html>`;
+
+  return new Response(html, {
+    status: 401,
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
+}
+
 function renderPortalPage(workerOrigin) {
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -239,6 +497,12 @@ function renderPortalPage(workerOrigin) {
       padding: 40px;
       box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
     }
+    .header-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+    }
     .badge {
       display: inline-flex;
       align-items: center;
@@ -250,7 +514,18 @@ function renderPortalPage(workerOrigin) {
       border-radius: 9999px;
       font-size: 12px;
       font-weight: 600;
-      margin-bottom: 20px;
+    }
+    .logout-btn {
+      color: var(--text-muted);
+      font-size: 12.5px;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      transition: color 0.2s;
+    }
+    .logout-btn:hover {
+      color: #f87171;
     }
     h1 {
       font-size: 26px;
@@ -332,7 +607,14 @@ function renderPortalPage(workerOrigin) {
 </head>
 <body>
   <div class="container">
-    <div class="badge">🚀 Cloudflare 加速代理</div>
+    <div class="header-bar">
+      <div class="badge">🛡️ 已通过认证 | 安全代理</div>
+      <a href="/__proxy_logout__" class="logout-btn">
+        <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
+        <span>退出登录</span>
+      </a>
+    </div>
+
     <h1>金山在线文档浏览器代理网关</h1>
     <p class="desc">专为企业局域网/网络受限环境设计，粘贴任意金山文档（智能表格/文字/演示）链接，一键穿透直达！</p>
     
