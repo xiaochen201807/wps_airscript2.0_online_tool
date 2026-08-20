@@ -1,15 +1,14 @@
 /**
- * Cloudflare Worker - 金山全生态在线文档与账号登录通用代理网关
+ * Cloudflare Worker - 金山全生态在线文档与账号登录通用代理网关（SSO 安全白名单兼容修复版）
  * 
- * 🌟 全面支持：
- * 1. 📄 在线文档与智能表格：www.kdocs.cn / doc.kdocs.cn / drive.kdocs.cn 等
- * 2. 🔐 统一身份认证与单点登录 SSO：account.wps.cn / passport.wps.cn / vip.wps.cn / www.wps.cn 等
- * 3. 🌐 全站动静态资源自动代理与 Client-side 脚本拦截注入（自动劫持 window.open、fetch、a 标签跳转）
- * 4. 🍪 跨域 SSO Cookie 与 302 重定向全自动重写与映射
- * 5. 🛡️ 密码访问控制与防滥用认证保护（默认密码：atwasoft）
+ * 🌟 核心防跳出与 SSO 兼容机制：
+ * 1. 🛡️ SSO 白名单参数透明透传：保留发往金山服务端的官方 cb/redirect 回调参数，彻底解决 403 Forbidden 问题；
+ * 2. 🔄 服务端 302 重定向拦截：只在响应给浏览器时动态添加 Worker 代理前缀，浏览器无感重定向；
+ * 3. 🌐 全站动静态资源代理：智能加载 *.wps.cn、*.kdocs.cn、*.wpscdn.cn、*.kingsoft.net 资源；
+ * 4. 🍪 跨域 SSO 会话 Cookie 全自动映射与保持；
+ * 5. 🔑 安全访问认证（默认密码：atwasoft）。
  */
 
-// 默认备用访问密码（可在 Cloudflare 环境变量 PROXY_PASSWORD 中配置）
 const DEFAULT_PASSWORD = "atwasoft";
 const DEFAULT_TARGET_HOST = "www.kdocs.cn";
 const AUTH_COOKIE_NAME = "_kdocs_proxy_auth";
@@ -22,17 +21,14 @@ export default {
     const correctPassword = (env && env.PROXY_PASSWORD) || DEFAULT_PASSWORD;
 
     // ==================== 1. 认证状态检查 ====================
-    // 处理登录表单提交请求 POST /__proxy_login__
     if (requestUrl.pathname === "/__proxy_login__" && request.method === "POST") {
       return handleLoginSubmit(request, requestUrl, correctPassword);
     }
 
-    // 处理退出登录 GET /__proxy_logout__
     if (requestUrl.pathname === "/__proxy_logout__") {
       return handleLogout(requestUrl);
     }
 
-    // 校验当前请求是否已通过认证
     const isAuthenticated = checkAuthentication(request, requestUrl, correctPassword);
 
     if (!isAuthenticated) {
@@ -46,13 +42,11 @@ export default {
     }
 
     // ==================== 2. 正常代理路由 ====================
-    // 如果是首页且无目标参数，展示已登录的 Web 导航门户
     if (requestUrl.pathname === "/" && !requestUrl.searchParams.has("url")) {
       return renderPortalPage(workerOrigin);
     }
 
-    // 解析目标 URL
-    let targetUrlStr = extractTargetUrl(requestUrl, request);
+    let targetUrlStr = extractTargetUrl(requestUrl, request, workerOrigin);
     if (!targetUrlStr) {
       return new Response("无效的目标 URL 请求", { status: 400 });
     }
@@ -84,7 +78,7 @@ export default {
       });
     }
 
-    // 构造转发请求头
+    // 构造转发请求头，对金山服务器保持 100% 官方环境伪装
     const newHeaders = new Headers(request.headers);
     newHeaders.set("Host", targetUrl.host);
     newHeaders.set("Origin", targetUrl.origin);
@@ -108,17 +102,16 @@ export default {
 
       // 重写响应头
       const modifiedHeaders = new Headers(response.headers);
-      modifiedHeaders.set("Access-Control-Allow-Origin", "*");
+      modifiedHeaders.set("Access-Control-Allow-Origin": "*");
       modifiedHeaders.set("Access-Control-Allow-Credentials", "true");
 
-      // 记录当前访问的 Host，方便后续相对路径定位
       const currentHost = targetUrl.host;
       modifiedHeaders.append(
         "Set-Cookie",
         `${LAST_HOST_COOKIE_NAME}=${currentHost}; Path=/; SameSite=Lax; HttpOnly; Secure`
       );
 
-      // 重写 301 / 302 / 307 重定向目标（特别是 SSO 登录与回调）
+      // 重写 301 / 302 / 307 重定向目标（下发给浏览器时转换为代理链接）
       const location = modifiedHeaders.get("Location");
       if (location) {
         let redirectTarget;
@@ -128,16 +121,15 @@ export default {
           redirectTarget = location;
         }
 
-        // 如果重定向包含了 cb= 或 redirect_url= 回调，把里面的金山地址也代理化
-        redirectTarget = rewriteCallbackUrls(redirectTarget, workerOrigin);
+        // 清理并包装成代理 URL
+        redirectTarget = unwrapWorkerPrefix(redirectTarget, workerOrigin);
         modifiedHeaders.set("Location", `${workerOrigin}/${redirectTarget}`);
       }
 
-      // 重写 Set-Cookie（剥离原站 Domain 限制，确保在当前 Worker 代理域下生效）
+      // 重写 Set-Cookie（剥离原站 Domain 限制）
       const cookies = response.headers.getSetCookie ? response.headers.getSetCookie() : [];
       if (cookies.length > 0) {
         modifiedHeaders.delete("Set-Cookie");
-        // 重新添加记录 host 的 cookie
         modifiedHeaders.append(
           "Set-Cookie",
           `${LAST_HOST_COOKIE_NAME}=${currentHost}; Path=/; SameSite=Lax; HttpOnly; Secure`
@@ -153,10 +145,12 @@ export default {
       modifiedHeaders.delete("X-Frame-Options");
       modifiedHeaders.delete("Content-Security-Policy");
 
-      // 若为 HTML 页面，进行内容替换并注入客户端拦截脚本
       const contentType = modifiedHeaders.get("Content-Type") || "";
+
+      // 若为 HTML 页面，执行 DOM 属性替换并注入客户端拦截脚本
       if (contentType.includes("text/html")) {
         let htmlText = await response.text();
+        htmlText = rewriteHtmlContent(htmlText, workerOrigin);
         htmlText = injectProxyInterceptorScript(htmlText, workerOrigin, targetUrl.origin);
         return new Response(htmlText, {
           status: response.status,
@@ -179,41 +173,52 @@ export default {
   },
 };
 
-// ==================== URL 与回调重写逻辑 ====================
+// ==================== URL 解析与清洗逻辑 ====================
 
-function rewriteCallbackUrls(urlStr, workerOrigin) {
+function unwrapWorkerPrefix(urlStr, workerOrigin) {
+  if (urlStr.startsWith(workerOrigin + "/")) {
+    urlStr = urlStr.slice(workerOrigin.length + 1);
+  }
+  return urlStr;
+}
+
+function cleanProxyParams(targetUrlStr, workerOrigin) {
   try {
-    const u = new URL(urlStr);
+    const u = new URL(targetUrlStr);
     for (const key of ["cb", "redirect", "redirect_url", "target", "return_url"]) {
       if (u.searchParams.has(key)) {
-        const origCb = u.searchParams.get(key);
-        if (origCb.startsWith("http://") || origCb.startsWith("https://")) {
-          u.searchParams.set(key, `${workerOrigin}/${origCb}`);
+        let val = u.searchParams.get(key);
+        // 如果回调参数包含了 worker 域名，清洗还原为原生的金山官方地址
+        if (val.startsWith(workerOrigin + "/")) {
+          val = val.slice(workerOrigin.length + 1);
+        }
+        if (val.startsWith("https://") || val.startsWith("http://")) {
+          u.searchParams.set(key, val);
         }
       }
     }
     return u.toString();
   } catch {
-    return urlStr;
+    return targetUrlStr;
   }
 }
 
-function extractTargetUrl(requestUrl, request) {
+function extractTargetUrl(requestUrl, request, workerOrigin) {
   // 1. 通过 ?url= 参数
   if (requestUrl.searchParams.has("url")) {
-    return requestUrl.searchParams.get("url");
+    return cleanProxyParams(requestUrl.searchParams.get("url"), workerOrigin);
   }
 
   // 2. 通过路径前缀提取 https://worker.dev/https://account.wps.cn/xxx
   let pathname = requestUrl.pathname.slice(1);
   if (pathname.startsWith("http://") || pathname.startsWith("https://")) {
-    return pathname + requestUrl.search;
+    return cleanProxyParams(pathname + requestUrl.search, workerOrigin);
   }
   if (pathname.startsWith("http:/") && !pathname.startsWith("http://")) {
-    return pathname.replace("http:/", "http://") + requestUrl.search;
+    return cleanProxyParams(pathname.replace("http:/", "http://") + requestUrl.search, workerOrigin);
   }
   if (pathname.startsWith("https:/") && !pathname.startsWith("https://")) {
-    return pathname.replace("https:/", "https://") + requestUrl.search;
+    return cleanProxyParams(pathname.replace("https:/", "https://") + requestUrl.search, workerOrigin);
   }
 
   // 3. 根据路径特征智能推断金山子系统
@@ -223,9 +228,10 @@ function extractTargetUrl(requestUrl, request) {
     pathLower.startsWith("/sso") ||
     pathLower.startsWith("/auth") ||
     pathLower.startsWith("/api/v4/user") ||
-    pathLower.startsWith("/api/v3/user")
+    pathLower.startsWith("/api/v3/user") ||
+    pathLower.startsWith("/account/")
   ) {
-    return `https://account.wps.cn${requestUrl.pathname}${requestUrl.search}`;
+    return cleanProxyParams(`https://account.wps.cn${requestUrl.pathname}${requestUrl.search}`, workerOrigin);
   }
 
   // 4. 从 Referer 提取 Host
@@ -235,7 +241,7 @@ function extractTargetUrl(requestUrl, request) {
       const refUrl = new URL(referer);
       const extractedHost = extractHostFromReferer(refUrl);
       if (extractedHost) {
-        return `https://${extractedHost}${requestUrl.pathname}${requestUrl.search}`;
+        return cleanProxyParams(`https://${extractedHost}${requestUrl.pathname}${requestUrl.search}`, workerOrigin);
       }
     } catch {}
   }
@@ -244,10 +250,10 @@ function extractTargetUrl(requestUrl, request) {
   const cookieHeader = request.headers.get("Cookie") || "";
   const lastHost = getCookieValue(cookieHeader, LAST_HOST_COOKIE_NAME);
   if (lastHost && isValidWpsHost(lastHost)) {
-    return `https://${lastHost}${requestUrl.pathname}${requestUrl.search}`;
+    return cleanProxyParams(`https://${lastHost}${requestUrl.pathname}${requestUrl.search}`, workerOrigin);
   }
 
-  return `https://${DEFAULT_TARGET_HOST}${requestUrl.pathname}${requestUrl.search}`;
+  return cleanProxyParams(`https://${DEFAULT_TARGET_HOST}${requestUrl.pathname}${requestUrl.search}`, workerOrigin);
 }
 
 function isValidWpsHost(host) {
@@ -269,7 +275,20 @@ function extractHostFromReferer(refUrl) {
   return null;
 }
 
-// ==================== 客户端拦截脚本注入 ====================
+// ==================== HTML 内容重写与脚本注入 ====================
+
+function rewriteHtmlContent(html, workerOrigin) {
+  // 静态 CDN 资源替换
+  html = html.replace(/src=["']\/\/([a-zA-Z0-9.-]+\.(wpscdn\.cn|kingsoft\.net|wps\.cn|kdocs\.cn))([^"']*)["']/g, function(match, domain, root, path) {
+    return 'src="' + workerOrigin + '/https://' + domain + path + '"';
+  });
+
+  html = html.replace(/href=["']\/\/([a-zA-Z0-9.-]+\.(wpscdn\.cn|kingsoft\.net|wps\.cn|kdocs\.cn))([^"']*)["']/g, function(match, domain, root, path) {
+    return 'href="' + workerOrigin + '/https://' + domain + path + '"';
+  });
+
+  return html;
+}
 
 function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
   const interceptorScript = `
@@ -281,13 +300,17 @@ function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
     if (!url || typeof url !== 'string') return url;
     if (url.startsWith('//')) url = 'https:' + url;
     if (url.startsWith('https://account.wps.cn') ||
+        url.startsWith('https://account.kdocs.cn') ||
         url.startsWith('https://passport.wps.cn') ||
         url.startsWith('https://www.wps.cn') ||
         url.startsWith('https://vip.wps.cn') ||
         url.startsWith('https://www.kdocs.cn') ||
         url.startsWith('https://doc.kdocs.cn') ||
         url.startsWith('https://drive.kdocs.cn') ||
+        url.startsWith('https://ac.wpscdn.cn') ||
         url.indexOf('.kdocs.cn') !== -1 ||
+        url.indexOf('.wpscdn.cn') !== -1 ||
+        url.indexOf('.kingsoft.net') !== -1 ||
         url.indexOf('.wps.cn') !== -1) {
       if (!url.startsWith(PROXY_ORIGIN)) {
         return PROXY_ORIGIN + '/' + url;
@@ -318,6 +341,23 @@ function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
   XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
     return origXhrOpen.call(this, method, wrapUrl(url), async, user, password);
   };
+
+  // 动态监听 DOM 变动
+  if (window.MutationObserver) {
+    var observer = new MutationObserver(function(mutations) {
+      mutations.forEach(function(mutation) {
+        mutation.addedNodes.forEach(function(node) {
+          if (node.nodeType === 1) {
+            if (node.tagName === 'SCRIPT' && node.src) node.src = wrapUrl(node.src);
+            if (node.tagName === 'IFRAME' && node.src) node.src = wrapUrl(node.src);
+            if (node.tagName === 'LINK' && node.href) node.href = wrapUrl(node.href);
+            if (node.tagName === 'A' && node.href) node.href = wrapUrl(node.href);
+          }
+        });
+      });
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  }
 
   // 全局拦截链接点击
   document.addEventListener('click', function(e) {
@@ -760,7 +800,7 @@ function renderPortalPage(workerOrigin) {
     <p class="desc">支持智能表格、金山文档及账号登录中心（account.wps.cn），全链路穿透直达！</p>
     
     <div class="input-group">
-      <input type="text" id="docUrl" class="input-box" placeholder="粘贴链接，如 https://www.kdocs.cn/l/co63t9c3u9Q3 或 https://account.wps.cn" />
+      <input type="text" id="docUrl" class="input-box" placeholder="粘贴链接，如 https://www.kdocs.cn/l/coPgFixLFumk 或 https://account.wps.cn" />
       <button class="btn" onclick="openProxy()">
         <span>立即前往访问</span>
         <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"/></svg>
