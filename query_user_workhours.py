@@ -17,7 +17,7 @@ from wps_airscript_client import WPSAirScriptClient
 from config import get_workhours_config
 
 # 从环境变量/.env中读取配置
-FILE_ID, TOKEN, SCRIPT_ID, TARGET_PERSON_DEFAULT = get_workhours_config()
+FILE_ID, TOKEN, SCRIPT_ID, TARGET_PERSON_DEFAULT, BASE_URL = get_workhours_config()
 
 
 def get_all_week_sheets(sheets: List[str]) -> List[str]:
@@ -199,7 +199,7 @@ def main():
     specified_sheet = sys.argv[2] if len(sys.argv) > 2 else None
 
     print("🔒 启动纯只读查询工具，正在连接 WPS 智能表格...")
-    client = WPSAirScriptClient(FILE_ID, TOKEN, SCRIPT_ID)
+    client = WPSAirScriptClient(FILE_ID, TOKEN, SCRIPT_ID, base_url=BASE_URL)
 
     all_sheets = client.get_workbook_sheets()
     week_sheets = get_all_week_sheets(all_sheets)

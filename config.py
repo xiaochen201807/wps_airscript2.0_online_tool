@@ -45,23 +45,33 @@ load_dotenv()
 
 # ==================== 常用配置项获取接口 ====================
 
+def get_wps_base_url(default: str = "https://www.kdocs.cn") -> str:
+    """
+    获取 WPS API 基础 URL（支持通过 Cloudflare Worker 等反向代理）
+    例如: https://wps-proxy.yourname.workers.dev
+    """
+    return os.getenv("WPS_BASE_URL", default).rstrip('/')
+
+
 def get_wps_token(default: str = "your_token_here") -> str:
     """获取 WPS AirScript 统一 Token"""
     return os.getenv("WPS_TOKEN", default)
 
 
 def get_balance_sheet_config():
-    """获取资产负债表演示表格配置 (file_id, token, script_id)"""
+    """获取资产负债表演示表格配置 (file_id, token, script_id, base_url)"""
     file_id = os.getenv("BALANCE_SHEET_FILE_ID", "your_balance_sheet_file_id")
     token = os.getenv("WPS_TOKEN", "your_token_here")
     script_id = os.getenv("BALANCE_SHEET_SCRIPT_ID", "your_balance_sheet_script_id")
-    return file_id, token, script_id
+    base_url = get_wps_base_url()
+    return file_id, token, script_id, base_url
 
 
 def get_workhours_config():
-    """获取周计划/工时表格配置 (file_id, token, script_id, default_person)"""
+    """获取周计划/工时表格配置 (file_id, token, script_id, default_person, base_url)"""
     file_id = os.getenv("WORKHOURS_FILE_ID", "your_workhours_file_id")
     token = os.getenv("WPS_TOKEN", "your_token_here")
     script_id = os.getenv("WORKHOURS_SCRIPT_ID", "your_workhours_script_id")
     default_person = os.getenv("DEFAULT_PERSON_NAME", "张三")
-    return file_id, token, script_id, default_person
+    base_url = get_wps_base_url()
+    return file_id, token, script_id, default_person, base_url

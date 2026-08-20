@@ -8,7 +8,7 @@ from wps_airscript_client import WPSAirScriptClient
 from config import get_balance_sheet_config
 
 # 从环境变量/.env中读取配置
-FILE_ID, TOKEN, SCRIPT_ID = get_balance_sheet_config()
+FILE_ID, TOKEN, SCRIPT_ID, BASE_URL = get_balance_sheet_config()
 
 def build_advanced_balance_sheet():
     print("=" * 65)
@@ -16,7 +16,7 @@ def build_advanced_balance_sheet():
     if not TOKEN or TOKEN == "your_token_here":
         print("❌ 未检测到有效 Token，请在 .env 文件中配置 WPS_TOKEN 等信息！")
         return
-    client = WPSAirScriptClient(FILE_ID, TOKEN, SCRIPT_ID)
+    client = WPSAirScriptClient(FILE_ID, TOKEN, SCRIPT_ID, base_url=BASE_URL)
 
     sheets = client.get_workbook_sheets()
     sheet_name = sheets[0] if sheets and len(sheets) > 0 else "工作表1"

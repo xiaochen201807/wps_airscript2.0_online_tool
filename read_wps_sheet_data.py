@@ -9,14 +9,14 @@ from wps_airscript_client import WPSAirScriptClient
 from config import get_workhours_config
 
 # 从环境变量/.env中读取配置
-NEW_FILE_ID, NEW_TOKEN, NEW_SCRIPT_ID, _ = get_workhours_config()
+NEW_FILE_ID, NEW_TOKEN, NEW_SCRIPT_ID, _, BASE_URL = get_workhours_config()
 
 
 class SafeWPSReader:
     """WPS 智能表格安全只读客户端包装器"""
 
-    def __init__(self, file_id: str, token: str, script_id: str):
-        self.client = WPSAirScriptClient(file_id, token, script_id)
+    def __init__(self, file_id: str, token: str, script_id: str, base_url: str = BASE_URL):
+        self.client = WPSAirScriptClient(file_id, token, script_id, base_url=base_url)
 
     def get_sheets(self) -> List[str]:
         """获取工作簿中所有的工作表名称（纯只读）"""

@@ -53,13 +53,16 @@ class WPSAirScriptClient:
         url = f"{self.base_url}/api/v3/ide/file/{self.file_id}/script/{self.script_id}/sync_task"
         
         max_retries = 3
+        # 若直连 kdocs.cn 则尝试直连绕过本地 HTTP 代理；若是自定义代理(如 Cloudflare)则走系统默认网络
+        req_proxies = {"http": None, "https": None} if "kdocs.cn" in self.base_url else None
+
         for attempt in range(1, max_retries + 1):
             try:
                 response = requests.post(
                     url=url,
                     headers=self._get_headers(),
                     json={"Context": context},
-                    proxies={"http": None, "https": None},
+                    proxies=req_proxies,
                     timeout=123
                 )
                 response.raise_for_status()
