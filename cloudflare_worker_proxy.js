@@ -74,7 +74,7 @@ export default {
       const response = await fetch(proxyRequest);
 
       const modifiedResponse = new Response(response.body, response);
-      modifiedResponse.headers.set("Access-Control-Allow-Origin": "*");
+      modifiedResponse.headers.set("Access-Control-Allow-Origin", "*");
       modifiedResponse.headers.set(
         "Access-Control-Allow-Headers",
         "Content-Type, AirScript-Token, Authorization, X-Proxy-Auth"

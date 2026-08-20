@@ -113,8 +113,8 @@ export default {
 
       // 重写响应头
       const modifiedHeaders = new Headers(response.headers);
-      modifiedHeaders.set("Access-Control-Allow-Origin": "*");
-      modifiedHeaders.set("Access-Control-Allow-Credentials": "true");
+      modifiedHeaders.set("Access-Control-Allow-Origin", "*");
+      modifiedHeaders.set("Access-Control-Allow-Credentials", "true");
 
       // 重写 301 / 302 重定向目标
       const location = modifiedHeaders.get("Location");
