@@ -370,6 +370,8 @@ function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
 (function() {
   window.appConfig = {
     rootUrl: "",
+    defaultDomain: location.hostname,
+    protocolNames: ["privacy", "service"],
     whiteList: [
       "wps.cn",
       "kdocs.cn",
@@ -386,6 +388,16 @@ function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
     'drive.kdocs.cn', 'ac.wpscdn.cn', 'kdocs.cn', 'wps.cn',
     'wpscdn.cn', 'kingsoft.net'
   ];
+
+  // 屏蔽第三方 Cookie 弹窗并自动展示 body
+  const _origAlert = window.alert;
+  window.alert = function(msg) {
+    if (msg && typeof msg === 'string' && (msg.includes('第三方Cookie') || msg.includes('Cookie'))) {
+      if (document.body) document.body.style.display = 'block';
+      return;
+    }
+    return _origAlert.apply(this, arguments);
+  };
 
   function isWps(url) {
     if (!url || typeof url !== 'string') return false;
@@ -407,6 +419,17 @@ function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
   var _realCommon = {};
   var commonFallback = {
     checkCallback: function(url) { return url; },
+    formatUrl: function(url) { return wrap(url); },
+    addCookie: function(name, value, path, expires, domain) {
+      var cookieStr = name + "=" + encodeURIComponent(value) + "; path=/; SameSite=Lax; Secure";
+      document.cookie = cookieStr;
+    },
+    getCookie: function(name) {
+      var reg = new RegExp("(^| )" + name + "=([^;]*)(;|$)");
+      var arr = document.cookie.match(reg);
+      if (arr) return decodeURIComponent(arr[2]);
+      return null;
+    },
     getUrlParams: function(url) {
       url = url || location.search || location.href;
       var params = {};
@@ -429,6 +452,7 @@ function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
     },
     getBaseUrl: function() { return PROXY + "/https://account.wps.cn/"; },
     dwStatistics: function() {},
+    hrefTrust: function(url) { location.href = wrap(url); },
     hrefReplace: function(url) { location.href = wrap(url); },
     replaceToUrl: function(url, param) {
       if (param && typeof param === 'string') {
@@ -442,15 +466,18 @@ function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
     window.common = new Proxy(commonFallback, {
       get: function(target, prop) {
         if (prop === 'checkCallback') return function(url) { return url; };
+        if (prop === 'formatUrl') return function(url) { return wrap(url); };
+        if (prop === 'addCookie') return commonFallback.addCookie;
+        if (prop === 'getCookie') return commonFallback.getCookie;
         if (prop === 'getDomainUrl') {
           return function() {
             var fn = _realCommon.getDomainUrl || target.getDomainUrl;
             return wrap(fn.apply(this, arguments));
           };
         }
-        if (prop === 'hrefReplace') {
+        if (prop === 'hrefReplace' || prop === 'hrefTrust') {
           return function(url) {
-            var fn = _realCommon.hrefReplace || target.hrefReplace;
+            var fn = _realCommon[prop] || target.hrefReplace;
             return fn.call(this, wrap(url));
           };
         }
