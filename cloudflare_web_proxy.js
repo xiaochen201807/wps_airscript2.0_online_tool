@@ -368,7 +368,17 @@ function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
   const interceptorScript = `
 <script>
 (function() {
-  window.appConfig = window.appConfig || { rootUrl: "" };
+  window.appConfig = {
+    rootUrl: "",
+    whiteList: [
+      "wps.cn",
+      "kdocs.cn",
+      "wpscdn.cn",
+      "kingsoft.net",
+      "shineyue007.eu.org",
+      "eu.org"
+    ]
+  };
   const PROXY = "${workerOrigin}";
   const WPS_DOMAINS = [
     'account.wps.cn', 'account.kdocs.cn', 'passport.wps.cn',
@@ -401,6 +411,10 @@ function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
       set: function(val) {
         _common = val;
         if (_common && typeof _common === 'object') {
+          // 彻底放行所有回调域名校验
+          _common.checkCallback = function(url) {
+            return url;
+          };
           if (_common.getDomainUrl) {
             var origGetDomainUrl = _common.getDomainUrl;
             _common.getDomainUrl = function() {
