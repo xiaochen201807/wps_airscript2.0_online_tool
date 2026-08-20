@@ -90,16 +90,52 @@
 - ⚡ **批量数据处理**
 - 总共支持40+种操作，涵盖绝大部分的日常操作场景！ 
 
-#### 使用示例：（或直接参考本项目的 `test.py` 文件！）
+### **⚡ 3 步快速配置与使用**
+
+#### **第 1 步：安装依赖**
+```bash
+python3 -m venv .venv
+source .venv/bin/activate  # Windows 用户使用: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+#### **第 2 步：配置环境变量**
+复制配置模板生成 `.env` 文件：
+```bash
+cp .env.example .env
+```
+用编辑器打开 `.env` 文件，填入你的 WPS 表格参数：
+```ini
+WPS_TOKEN="你的Token令牌"
+WORKHOURS_FILE_ID="你的周计划表格ID"
+WORKHOURS_SCRIPT_ID="你的周计划脚本ID"
+DEFAULT_PERSON_NAME="你的名字"
+```
+
+#### **第 3 步：运行功能脚本**
+```bash
+# 1. 查询当前周（或最新周）个人工时
+python query_user_workhours.py
+
+# 2. 查询指定人员在指定周的工时（如 8.10-8.16）
+python query_user_workhours.py 刘晓晨 8.10-8.16
+
+# 3. 自动生成财务资产负债表与可视化看板
+python generate_balance_sheet.py
+```
+
+---
+
+#### 代码调用示例：（或直接参考本项目的 `test_wps_api.py` 文件！）
 
 ```python
 from wps_airscript_client import WPSAirScriptClient
+from config import get_balance_sheet_config
 
-# ==================== 配置信息 ====================
-FILE_ID = "cbK******2K"  # 替换为你的智能表格ID
-TOKEN = "2Ze***************dry"  # 替换为你的 Token令牌
-SCRIPT_ID = "V2-2vM******************D0iR"  # 替换为你的脚本ID
-SHEET_NAME = "工作表4"  # 默认工作表名称
+# 从 .env 自动读取配置
+FILE_ID, TOKEN, SCRIPT_ID = get_balance_sheet_config()
+client = WPSAirScriptClient(FILE_ID, TOKEN, SCRIPT_ID)
+```
 
 def get_client():
     """获取 API 客户端实例"""
