@@ -172,6 +172,15 @@ export default {
 
       const contentType = modifiedHeaders.get("Content-Type") || "";
 
+      // 若为 3xx 重定向，直接返回空 body 响应，确保浏览器严格遵循修改后的 Location
+      if (response.status >= 300 && response.status < 400) {
+        return new Response(null, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: modifiedHeaders,
+        });
+      }
+
       // 若为 HTML 页面，执行 DOM 属性替换并注入客户端拦截脚本
       if (contentType.includes("text/html")) {
         let htmlText = await response.text();
@@ -359,6 +368,7 @@ function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
   const interceptorScript = `
 <script>
 (function() {
+  window.appConfig = window.appConfig || { rootUrl: "" };
   const PROXY = "${workerOrigin}";
   const WPS_DOMAINS = [
     'account.wps.cn', 'account.kdocs.cn', 'passport.wps.cn',
