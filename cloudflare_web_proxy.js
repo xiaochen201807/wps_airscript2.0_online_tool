@@ -317,7 +317,10 @@ function isValidWpsHost(host) {
     host.endsWith("wps.cn") ||
     host.endsWith("kdocs.cn") ||
     host.endsWith("kingsoft.net") ||
-    host.endsWith("wpscdn.cn")
+    host.endsWith("wpscdn.cn") ||
+    host.endsWith("qq.com") ||
+    host.endsWith("weixin.qq.com") ||
+    host.endsWith("wechat.com")
   );
 }
 
@@ -386,7 +389,7 @@ function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
     'account.wps.cn', 'account.kdocs.cn', 'passport.wps.cn',
     'www.wps.cn', 'vip.wps.cn', 'www.kdocs.cn', 'doc.kdocs.cn',
     'drive.kdocs.cn', 'ac.wpscdn.cn', 'kdocs.cn', 'wps.cn',
-    'wpscdn.cn', 'kingsoft.net'
+    'wpscdn.cn', 'kingsoft.net', 'open.weixin.qq.com', 'weixin.qq.com', 'qq.com'
   ];
 
   // 屏蔽第三方 Cookie 弹窗并自动展示 body
