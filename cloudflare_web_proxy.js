@@ -1,12 +1,13 @@
 /**
  * Cloudflare Worker - 金山全生态在线文档与账号登录通用代理网关（SSO 安全白名单兼容修复版）
  * 
- * 🌟 核心防跳出与 SSO 兼容机制：
+ * 🌟 核心防跳出与 SSO 兼容机制（已强化）：
  * 1. 🛡️ SSO 白名单参数透明透传：保留发往金山服务端的官方 cb/redirect 回调参数，彻底解决 403 Forbidden 问题；
  * 2. 🔄 服务端 302 重定向拦截：只在响应给浏览器时动态添加 Worker 代理前缀，浏览器无感重定向；
  * 3. 🌐 全站动静态资源代理：智能加载 *.wps.cn、*.kdocs.cn、*.wpscdn.cn、*.kingsoft.net 资源；
- * 4. 🍪 跨域 SSO 会话 Cookie 全自动映射与保持；
+ * 4. 🍪 跨域 SSO 会话 Cookie 全自动映射与保持（强化 Domain/SameSite/Path 处理）；
  * 5. 🔑 安全访问认证（默认密码：atwasoft）。
+ * 6. 客户端拦截脚本大幅增强：覆盖 location / history / form / fetch / XHR / MutationObserver。
  */
 
 const DEFAULT_PASSWORD = "atwasoft";
@@ -78,17 +79,31 @@ export default {
       });
     }
 
-    // 构造转发请求头，对金山服务器保持 100% 官方环境伪装
+    // 构造转发请求头，对金山服务器保持官方环境伪装
     const newHeaders = new Headers(request.headers);
     newHeaders.set("Host", targetUrl.host);
     newHeaders.set("Origin", targetUrl.origin);
     newHeaders.set("Referer", targetUrl.origin + "/");
 
+    // 伪装常见浏览器头
+    if (!newHeaders.get("User-Agent")) {
+      newHeaders.set(
+        "User-Agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+      );
+    }
+    newHeaders.set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8");
+
+    // 清理可能暴露代理的头
     newHeaders.delete("cf-connecting-ip");
     newHeaders.delete("cf-ipcountry");
     newHeaders.delete("cf-ray");
     newHeaders.delete("cf-visitor");
     newHeaders.delete("X-Proxy-Auth");
+    newHeaders.delete("via");
+    newHeaders.delete("x-forwarded-for");
+    newHeaders.delete("x-forwarded-proto");
+    newHeaders.delete("x-real-ip");
 
     const proxyRequest = new Request(targetUrl.toString(), {
       method: request.method,
@@ -111,7 +126,7 @@ export default {
         `${LAST_HOST_COOKIE_NAME}=${currentHost}; Path=/; SameSite=Lax; HttpOnly; Secure`
       );
 
-      // 重写 301 / 302 / 307 重定向目标（下发给浏览器时转换为代理链接）
+      // 重写 301 / 302 / 307 重定向目标
       const location = modifiedHeaders.get("Location");
       if (location) {
         let redirectTarget;
@@ -120,25 +135,35 @@ export default {
         } catch {
           redirectTarget = location;
         }
-
-        // 清理并包装成代理 URL
         redirectTarget = unwrapWorkerPrefix(redirectTarget, workerOrigin);
         modifiedHeaders.set("Location", `${workerOrigin}/${redirectTarget}`);
       }
 
-      // 重写 Set-Cookie（剥离原站 Domain 限制）
+      // ========== 强化 Cookie 重写（核心修复） ==========
       const cookies = response.headers.getSetCookie ? response.headers.getSetCookie() : [];
       if (cookies.length > 0) {
         modifiedHeaders.delete("Set-Cookie");
+        // 保留我们自己的 last_host
         modifiedHeaders.append(
           "Set-Cookie",
           `${LAST_HOST_COOKIE_NAME}=${currentHost}; Path=/; SameSite=Lax; HttpOnly; Secure`
         );
+
         for (const cookie of cookies) {
-          const rewrittenCookie = cookie
-            .replace(/domain=[^;]+;?/gi, "")
-            .replace(/SameSite=None/gi, "SameSite=Lax");
-          modifiedHeaders.append("Set-Cookie", rewrittenCookie);
+          let rewritten = cookie
+            // 彻底去掉 Domain
+            .replace(/;\s*Domain=[^;]*/gi, "")
+            .replace(/Domain=[^;]*;?/gi, "")
+            // 强制 SameSite=Lax
+            .replace(/;\s*SameSite=[^;]*/gi, "; SameSite=Lax")
+            // 清理原有 Path 后统一加 Path=/
+            .replace(/;\s*Path=[^;]*/gi, "")
+            // 去掉原有 Secure 后强制加
+            .replace(/;\s*Secure/gi, "");
+
+          rewritten += "; Path=/; SameSite=Lax; Secure";
+
+          modifiedHeaders.append("Set-Cookie", rewritten);
         }
       }
 
@@ -185,14 +210,24 @@ function unwrapWorkerPrefix(urlStr, workerOrigin) {
 function cleanProxyParams(targetUrlStr, workerOrigin) {
   try {
     const u = new URL(targetUrlStr);
-    for (const key of ["cb", "redirect", "redirect_url", "target", "return_url"]) {
+    const keys = ["cb", "redirect", "redirect_url", "target", "return_url", "from", "callback", "state"];
+    for (const key of keys) {
       if (u.searchParams.has(key)) {
         let val = u.searchParams.get(key);
-        // 如果回调参数包含了 worker 域名，清洗还原为原生的金山官方地址
+        // 多层解码
+        try {
+          val = decodeURIComponent(val);
+          val = decodeURIComponent(val);
+        } catch { }
+
+        // 去掉 Worker 前缀
         if (val.startsWith(workerOrigin + "/")) {
           val = val.slice(workerOrigin.length + 1);
         }
-        if (val.startsWith("https://") || val.startsWith("http://")) {
+        // 去掉可能出现的双重协议
+        val = val.replace(/^https?:\/\/https?:\/\//, "https://");
+
+        if (val.startsWith("https://") || val.startsWith("http://") || val.startsWith("/")) {
           u.searchParams.set(key, val);
         }
       }
@@ -227,6 +262,7 @@ function extractTargetUrl(requestUrl, request, workerOrigin) {
     pathLower.startsWith("/passport") ||
     pathLower.startsWith("/sso") ||
     pathLower.startsWith("/auth") ||
+    pathLower.startsWith("/login") ||
     pathLower.startsWith("/api/v4/user") ||
     pathLower.startsWith("/api/v3/user") ||
     pathLower.startsWith("/account/")
@@ -243,7 +279,7 @@ function extractTargetUrl(requestUrl, request, workerOrigin) {
       if (extractedHost) {
         return cleanProxyParams(`https://${extractedHost}${requestUrl.pathname}${requestUrl.search}`, workerOrigin);
       }
-    } catch {}
+    } catch { }
   }
 
   // 5. 从 Cookie _kdocs_last_host 中获取最近访问的 Host
@@ -270,7 +306,7 @@ function extractHostFromReferer(refUrl) {
   if (p.startsWith("http://") || p.startsWith("https://")) {
     try {
       return new URL(p).host;
-    } catch {}
+    } catch { }
   }
   return null;
 }
@@ -279,11 +315,11 @@ function extractHostFromReferer(refUrl) {
 
 function rewriteHtmlContent(html, workerOrigin) {
   // 静态 CDN 资源替换
-  html = html.replace(/src=["']\/\/([a-zA-Z0-9.-]+\.(wpscdn\.cn|kingsoft\.net|wps\.cn|kdocs\.cn))([^"']*)["']/g, function(match, domain, root, path) {
+  html = html.replace(/src=["']\/\/([a-zA-Z0-9.-]+\.(wpscdn\.cn|kingsoft\.net|wps\.cn|kdocs\.cn))([^"']*)["']/g, function (match, domain, root, path) {
     return 'src="' + workerOrigin + '/https://' + domain + path + '"';
   });
 
-  html = html.replace(/href=["']\/\/([a-zA-Z0-9.-]+\.(wpscdn\.cn|kingsoft\.net|wps\.cn|kdocs\.cn))([^"']*)["']/g, function(match, domain, root, path) {
+  html = html.replace(/href=["']\/\/([a-zA-Z0-9.-]+\.(wpscdn\.cn|kingsoft\.net|wps\.cn|kdocs\.cn))([^"']*)["']/g, function (match, domain, root, path) {
     return 'href="' + workerOrigin + '/https://' + domain + path + '"';
   });
 
@@ -294,83 +330,90 @@ function injectProxyInterceptorScript(html, workerOrigin, currentOrigin) {
   const interceptorScript = `
 <script>
 (function() {
-  var PROXY_ORIGIN = "${workerOrigin}";
-  
-  function wrapUrl(url) {
+  const PROXY = "${workerOrigin}";
+  const WPS_DOMAINS = [
+    'account.wps.cn', 'account.kdocs.cn', 'passport.wps.cn',
+    'www.wps.cn', 'vip.wps.cn', 'www.kdocs.cn', 'doc.kdocs.cn',
+    'drive.kdocs.cn', 'ac.wpscdn.cn', 'kdocs.cn', 'wps.cn',
+    'wpscdn.cn', 'kingsoft.net'
+  ];
+
+  function isWps(url) {
+    if (!url || typeof url !== 'string') return false;
+    try {
+      const u = new URL(url, location.href);
+      return WPS_DOMAINS.some(d => u.hostname === d || u.hostname.endsWith('.' + d));
+    } catch { return false; }
+  }
+
+  function wrap(url) {
     if (!url || typeof url !== 'string') return url;
-    if (url.startsWith('//')) url = 'https:' + url;
-    if (url.startsWith('https://account.wps.cn') ||
-        url.startsWith('https://account.kdocs.cn') ||
-        url.startsWith('https://passport.wps.cn') ||
-        url.startsWith('https://www.wps.cn') ||
-        url.startsWith('https://vip.wps.cn') ||
-        url.startsWith('https://www.kdocs.cn') ||
-        url.startsWith('https://doc.kdocs.cn') ||
-        url.startsWith('https://drive.kdocs.cn') ||
-        url.startsWith('https://ac.wpscdn.cn') ||
-        url.indexOf('.kdocs.cn') !== -1 ||
-        url.indexOf('.wpscdn.cn') !== -1 ||
-        url.indexOf('.kingsoft.net') !== -1 ||
-        url.indexOf('.wps.cn') !== -1) {
-      if (!url.startsWith(PROXY_ORIGIN)) {
-        return PROXY_ORIGIN + '/' + url;
-      }
-    }
+    if (url.startsWith('//')) url = location.protocol + url;
+    if (url.startsWith(PROXY)) return url;
+    if (isWps(url)) return PROXY + '/' + url;
     return url;
   }
 
-  // 劫持 window.open
-  var origOpen = window.open;
-  window.open = function(url, target, features) {
-    return origOpen.call(window, wrapUrl(url), target, features);
+  // window.open
+  const _open = window.open;
+  window.open = function(url, ...args) {
+    return _open.call(this, wrap(url), ...args);
   };
 
-  // 劫持 fetch
-  var origFetch = window.fetch;
+  // location 相关
+  const _assign = location.assign.bind(location);
+  const _replace = location.replace.bind(location);
+  location.assign = url => _assign(wrap(url));
+  location.replace = url => _replace(wrap(url));
+
+  // history
+  const _push = history.pushState.bind(history);
+  const _replaceState = history.replaceState.bind(history);
+  history.pushState = (state, title, url) => _push(state, title, url ? wrap(url) : url);
+  history.replaceState = (state, title, url) => _replaceState(state, title, url ? wrap(url) : url);
+
+  // fetch
+  const _fetch = window.fetch;
   window.fetch = function(input, init) {
-    if (typeof input === 'string') {
-      input = wrapUrl(input);
-    } else if (input instanceof Request) {
-      input = new Request(wrapUrl(input.url), input);
-    }
-    return origFetch.call(window, input, init);
+    if (typeof input === 'string') input = wrap(input);
+    else if (input instanceof Request) input = new Request(wrap(input.url), input);
+    return _fetch.call(this, input, init);
   };
 
-  // 劫持 XMLHttpRequest
-  var origXhrOpen = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
-    return origXhrOpen.call(this, method, wrapUrl(url), async, user, password);
+  // XHR
+  const _xhrOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+    return _xhrOpen.call(this, method, wrap(url), ...rest);
   };
 
-  // 动态监听 DOM 变动
+  // 动态节点
   if (window.MutationObserver) {
-    var observer = new MutationObserver(function(mutations) {
-      mutations.forEach(function(mutation) {
-        mutation.addedNodes.forEach(function(node) {
-          if (node.nodeType === 1) {
-            if (node.tagName === 'SCRIPT' && node.src) node.src = wrapUrl(node.src);
-            if (node.tagName === 'IFRAME' && node.src) node.src = wrapUrl(node.src);
-            if (node.tagName === 'LINK' && node.href) node.href = wrapUrl(node.href);
-            if (node.tagName === 'A' && node.href) node.href = wrapUrl(node.href);
-          }
+    new MutationObserver(mutations => {
+      mutations.forEach(m => {
+        m.addedNodes.forEach(node => {
+          if (node.nodeType !== 1) return;
+          ['src', 'href'].forEach(attr => {
+            if (node[attr]) node[attr] = wrap(node[attr]);
+          });
         });
       });
-    });
-    observer.observe(document.documentElement, { childList: true, subtree: true });
+    }).observe(document.documentElement, { childList: true, subtree: true });
   }
 
-  // 全局拦截链接点击
-  document.addEventListener('click', function(e) {
-    var target = e.target;
-    while (target && target.tagName !== 'A') {
-      target = target.parentElement;
+  // 点击拦截
+  document.addEventListener('click', e => {
+    let t = e.target;
+    while (t && t.tagName !== 'A') t = t.parentElement;
+    if (t && t.href) {
+      const w = wrap(t.href);
+      if (w !== t.href) t.href = w;
     }
-    if (target && target.href) {
-      var wrapped = wrapUrl(target.href);
-      if (wrapped !== target.href) {
-        target.href = wrapped;
-      }
-    }
+  }, true);
+
+  // 表单提交（登录表单经常用 form action）
+  document.addEventListener('submit', e => {
+    const form = e.target;
+    if (form.action) form.action = wrap(form.action);
   }, true);
 })();
 </script>
@@ -435,7 +478,7 @@ async function handleLoginSubmit(request, requestUrl, correctPassword) {
         redirectUrl = json.redirect || "/";
       }
     }
-  } catch (err) {}
+  } catch (err) { }
 
   passwordInput = String(passwordInput).trim();
   const validPassword = String(correctPassword).trim();
